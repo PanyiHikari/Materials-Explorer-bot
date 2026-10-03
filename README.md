@@ -138,8 +138,8 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 
 ### Cooldown mechanism
 
-- `/mp` and `/mp.prev` **share** one cooldown timer, duration **2 minutes**
-- `/mp.search` has its own timer, duration **2 minutes**
+- `/mp` and `/mp.prev` **share** one cooldown timer, duration **1 minutes**
+- `/mp.search` has its own timer, duration **1 minutes**
 - Cooldowns are **tracked separately per group**
 - Pagination commands `nextp` / `lastp` have **no cooldown**
 
