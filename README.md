@@ -1,3 +1,5 @@
+[简体中文](README_ZH.md)
+
 # Materials Project Bot
 
 A [NoneBot2](https://github.com/nonebot/nonebot2) plugin that connects to the [Materials Project](https://materialsproject.org/) API, allowing users to query crystal structures, search for materials, retrieve CIF files, and render crystal structure images via [VESTA](https://jp-minerals.org/vesta/) in QQ group chats.
