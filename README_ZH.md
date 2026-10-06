@@ -131,7 +131,7 @@ SEARCH_PAGE_SIZE=10
 | `Fe,Co,Ni` | 至少含元素 | 材料中至少含 Fe、Co、Ni |
 | `Fe2O3` | 化学式 | 按化学式精确匹配 |
 
-### 管理指令（不在 `/mp.help` 索引中）
+### 管理指令
 
 | 指令 | 说明 |
 |---|---|
@@ -185,7 +185,31 @@ VESTA -open structure.cif -export_img output.png -close
 指定晶面投影时附加旋转参数：
 
 ```bash
-VESTA -open structure.cif -rotate_x 30 -rotate_y 45 -export_img output.png -close
+VESTA -open structure.cif -rotate_x a -rotate_y b -export_img output.png -close
+```
+
+其中旋转参数`a`, `b`的计算方法如下：
+```python
+# pymatgen 的 lattice.matrix 行向量为 a, b, c
+lat = np.array(structure.lattice.matrix)
+# 倒格基：列向量为 a*, b*, c*
+recip = np.linalg.inv(lat).T
+
+# (hkl) 晶面法线方向在笛卡尔坐标中的向量
+normal = h * recip[:, 0] + k * recip[:, 1] + l * recip[:, 2]
+norm = np.linalg.norm(normal)
+if norm < 1e-12:
+    return 0.0, 0.0, 0.0
+vx, vy, vz = normal / norm
+
+# 步骤 1：绕 x 轴旋转 a，使 vy -> 0
+a = float(np.degrees(np.arctan2(vy, vz)))
+
+# 步骤 2：绕 y 轴旋转 b，使 vx -> 0
+v_z_after_x = float(np.sqrt(vy ** 2 + vz ** 2))
+b = float(np.degrees(np.arctan2(-vx, v_z_after_x)))
+
+return a, b, 0.0
 ```
 
 ### 已知限制
@@ -197,6 +221,7 @@ VESTA -open structure.cif -rotate_x 30 -rotate_y 45 -export_img output.png -clos
   ```bash
   xvfb-run -a /path/to/VESTA -open structure.cif -export_img output.png -close
   ```
+```
 
   或在 `render_vesta.py` 的 `Popen` 参数前加上 `["xvfb-run", "-a"]`。
 
@@ -209,7 +234,7 @@ VESTA -open structure.cif -rotate_x 30 -rotate_y 45 -export_img output.png -clos
 
 未安装 Materials Project SDK。在虚拟环境中执行：
 
-```bash
+​```bash
 pip install mp-api pymatgen
 ```
 </details>
