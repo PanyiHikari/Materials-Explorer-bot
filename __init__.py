@@ -106,6 +106,25 @@ async def _check_enabled_and_cooldown(
 
     return True
 
+async def _check_res_cooldown(bot: Bot, event: GroupMessageEvent) -> bool:
+    """
+    检查 /mp.res 与 /mp.res.prev 的启用状态与冷却。
+    规则：同一群聊在 60 秒窗口内，这两个指令的累计成功调用不超过 3 次。
+    """
+    group_id = _get_group_id(event)
+
+    if not is_enabled(group_id):
+        await bot.send(event, "mp 指令已禁用")
+        return False
+
+    ok, remaining = cooldown_mgr.check_res(group_id)
+    if not ok:
+        await bot.send(event, f"指令冷却中，剩余{remaining}秒")
+        return False
+
+    cooldown_mgr.update_res(group_id)
+    return True
+
 # ==================== 事件响应器 ====================
 
 # /mp.help
@@ -217,12 +236,13 @@ mp_res_cmd = on_command("mp.res", rule=to_me(), priority=10, block=True)
 @mp_res_cmd.handle()
 async def handle_mp_res(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
     group_id = _get_group_id(event)
-    if not is_enabled(group_id):
-        await bot.send(event, "mp 指令已禁用")
-        return
 
+    # 先检查"未进行搜索"，避免无意义地进入冷却
     if get_cache(group_id) is None:
         await bot.send(event, "未进行搜索")
+        return
+
+    if not await _check_res_cooldown(bot, event):
         return
 
     text = args.extract_plain_text().strip()
@@ -244,12 +264,12 @@ mp_res_prev_cmd = on_command("mp.res.prev", rule=to_me(), priority=10, block=Tru
 @mp_res_prev_cmd.handle()
 async def handle_mp_res_prev(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
     group_id = _get_group_id(event)
-    if not is_enabled(group_id):
-        await bot.send(event, "mp 指令已禁用")
-        return
 
     if get_cache(group_id) is None:
         await bot.send(event, "未进行搜索")
+        return
+
+    if not await _check_res_cooldown(bot, event):
         return
 
     text = args.extract_plain_text().strip()
