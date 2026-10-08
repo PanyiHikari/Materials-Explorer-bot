@@ -69,26 +69,40 @@ async def _send_vesta_image(
     material_id: str,
     view: str = None,
 ):
-    """用 VESTA 渲染并发送图片"""
-    png_path = await render_crystal(material_id, view)
-    if png_path is None or not os.path.exists(png_path):
-        await bot.send(event, f"VESTA 渲染 {material_id} 失败，请检查 VESTA 配置。")
-        return
+    """
+    渲染并发送晶体结构图片。
+    """
+    if view is None:
+        views = ["113"]
+    elif view.lower() == "tri":
+        views = ["100", "010", "001"]
+    else:
+        views = [view]
 
-    try:
-        with open(png_path, "rb") as f:
-            image_data = f.read()
-        await bot.send(event, MessageSegment.image(image_data))
-    finally:
-        # 清理临时文件
+    any_success = False
+    for v in views:
+        png_path = await render_crystal(material_id, v)
+        if png_path is None or not os.path.exists(png_path):
+            logger.warning(f"渲染 {material_id} ({v}) 失败")
+            continue
+
+        any_success = True
         try:
-            os.remove(png_path)
-            parent = os.path.dirname(png_path)
-            if os.path.exists(parent):
-                import shutil
-                shutil.rmtree(parent, ignore_errors=True)
-        except Exception:
-            pass
+            with open(png_path, "rb") as f:
+                image_data = f.read()
+            await bot.send(event, MessageSegment.image(image_data))
+        finally:
+            try:
+                os.remove(png_path)
+                parent = os.path.dirname(png_path)
+                if os.path.exists(parent):
+                    import shutil
+                    shutil.rmtree(parent, ignore_errors=True)
+            except Exception:
+                pass
+
+    if not any_success:
+        await bot.send(event, f"晶体结构渲染 {material_id} 失败，请查看后台日志。")
 
 async def _check_enabled_and_cooldown(
     bot: Bot,
@@ -148,11 +162,13 @@ async def handle_help(bot: Bot, event: GroupMessageEvent):
         "/mp <material_id> - 获取 CIF 文件\n"
         "/mp.prev <material_id> - 默认视图渲染图片\n"
         "/mp.prev <material_id> <hkl> - 沿指定晶面投影渲染\n"
+        "/mp.prev <material_id> tri - 渲染三视图\n"
         "/mp.search <搜索条件> - 搜索晶体\n"
         "  nextp / lastp - 翻页（无需 @）\n"
         "/mp.res <序号> - 获取搜索结果 CIF\n"
         "/mp.res.prev <序号> - 渲染搜索结果默认视图\n"
         "/mp.res.prev <序号> <hkl> - 渲染搜索结果投影图\n"
+        "/mp.res.prev <序号> tri - 渲染搜索结果三视图\n"
         "/mp.res.CLR - 清除搜索结果"
     )
     await bot.send(event, help_text)
