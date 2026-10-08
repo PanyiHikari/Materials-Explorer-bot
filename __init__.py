@@ -6,6 +6,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.params import CommandArg, RegexGroup
 from nonebot.typing import T_State
 from nonebot.log import logger
+from nonebot.plugin import PluginMetadata
 import re
 import os
 import tempfile
@@ -20,7 +21,16 @@ from .search import (
 from .cooldown import cooldown_mgr
 from .admin import is_enabled, toggle
 
-# ==================== 工具函数 ====================
+# 帮助信息
+
+__plugin_meta__ = PluginMetadata(
+    name="Materials Project 工具",
+    description="输入 /mp.help 获取帮助信息",
+    usage="输入 /mp.help 获取帮助信息",
+    type="application",
+)
+
+# 工具函数
 
 def _get_group_id(event: GroupMessageEvent) -> str:
     return str(event.group_id)
@@ -81,26 +91,26 @@ async def _send_vesta_image(
             pass
 
 async def _check_enabled_and_cooldown(
-    bot: Bot,                       # <-- 新增 bot 参数
+    bot: Bot,
     event: GroupMessageEvent,
     check_type: str = "mp",
 ) -> bool:
     group_id = _get_group_id(event)
 
     if not is_enabled(group_id):
-        await bot.send(event, "mp 指令已禁用")   # <-- 使用 bot
+        await bot.send(event, "mp 指令已禁用")
         return False
 
     if check_type == "mp":
         ok, remaining = cooldown_mgr.check_mp(group_id)
         if not ok:
-            await bot.send(event, f"指令冷却中，剩余{remaining}秒")  # <-- 使用 bot
+            await bot.send(event, f"指令冷却中，剩余{remaining}秒")
             return False
         cooldown_mgr.update_mp(group_id)
     elif check_type == "search":
         ok, remaining = cooldown_mgr.check_search(group_id)
         if not ok:
-            await bot.send(event, f"指令冷却中，剩余{remaining}秒")  # <-- 使用 bot
+            await bot.send(event, f"指令冷却中，剩余{remaining}秒")
             return False
         cooldown_mgr.update_search(group_id)
 
@@ -125,7 +135,7 @@ async def _check_res_cooldown(bot: Bot, event: GroupMessageEvent) -> bool:
     cooldown_mgr.update_res(group_id)
     return True
 
-# ==================== 事件响应器 ====================
+# 事件响应器
 
 # /mp.help
 help_cmd = on_command("mp.help", rule=to_me(), priority=10, block=True)
