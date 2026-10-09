@@ -142,6 +142,7 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 
 - `/mp` and `/mp.prev` **share** one cooldown timer, with a duration of **1 minute**
 - `/mp.search` has a separate timer, with a duration of **1 minute**
+- `/mp.res` and `/mp.res.prev` share one cooling timer, which limits the number of calls to **no more than 3 times per 1 minute**
 - Cooldowns are **calculated independently per group chat**
 - The page-turning commands `nextp` / `lastp` have **no cooldown**
 
