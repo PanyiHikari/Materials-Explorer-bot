@@ -13,7 +13,7 @@ class CooldownManager:
         # group_id -> (window_start, count)  用于 /mp.res 与 /mp.res.prev
         self._res_windows: Dict[str, Tuple[float, int]] = {}
 
-    # ---------- 内部工具 ----------
+    # 内部工具
 
     def _get_timers(self, group_id: str) -> Tuple[float, float]:
         if group_id not in self._timers:
@@ -24,7 +24,7 @@ class CooldownManager:
         """向上取整返回剩余秒数，至少 1 秒"""
         return max(1, math.ceil(self.cooldown - elapsed))
 
-    # ---------- /mp 与 /mp.prev ----------
+    # /mp 与 /mp.prev
 
     def check_mp(self, group_id: str) -> Tuple[bool, int]:
         mp_time, _ = self._get_timers(group_id)
@@ -37,7 +37,7 @@ class CooldownManager:
         mp_time, search_time = self._get_timers(group_id)
         self._timers[group_id] = (time.time(), search_time)
 
-    # ---------- /mp.search ----------
+    # /mp.search
 
     def check_search(self, group_id: str) -> Tuple[bool, int]:
         _, search_time = self._get_timers(group_id)
@@ -50,9 +50,7 @@ class CooldownManager:
         mp_time, search_time = self._get_timers(group_id)
         self._timers[group_id] = (mp_time, time.time())
 
-    # ---------- /mp.res 与 /mp.res.prev ----------
-    # 规则：从第一次成功调用的时刻起，在 cooldown 秒的窗口内最多允许 3 次，
-    #       第 4 次及之后拒绝；窗口到期后自动重置。
+    # /mp.res 与 /mp.res.prev
 
     def check_res(self, group_id: str) -> Tuple[bool, int]:
         now = time.time()
@@ -77,7 +75,7 @@ class CooldownManager:
         else:
             self._res_windows[group_id] = (start, count + 1)
 
-    # ---------- 管理指令 ----------
+    # 管理指令
 
     def reset_all(self, group_id: str):
         """将该群所有冷却时间归零"""

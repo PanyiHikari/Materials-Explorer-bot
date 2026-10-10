@@ -2,7 +2,7 @@
 
 # Materials Project Bot
 
-A QQ bot plugin based on [NoneBot2](https://github.com/nonebot/nonebot2) that integrates with the [Materials Project](https://materialsproject.org/) API to query crystal structures, search materials, obtain CIF files, and render crystal structure images via [VESTA](https://jp-minerals.org/vesta/) in group chats.
+A QQ bot plugin based on [NoneBot2](https://github.com/nonebot/nonebot2) that integrates with the [Materials Project](https://materialsproject.org/) API to query crystal structures, search materials, obtain CIF files, and render crystal structure images via [VESTA](https://jp-minerals.org/vesta/) in group chats. It also integrates with DeepSeek to automatically recognize natural-language crystal queries in group chats and execute them on the user's behalf.
 
 ---
 
@@ -10,11 +10,13 @@ A QQ bot plugin based on [NoneBot2](https://github.com/nonebot/nonebot2) that in
 
 - **Material query**: Obtain symmetrized CIF files by `material_id` (e.g., `mp-162`)
 - **Structure rendering**: Call VESTA to render the default view or a specified crystal plane projection image of a crystal structure
+- **Three-view mode**: The `tri` parameter renders three orthogonal projections along (100), (010), and (001) in one shot
 - **Material search**: Support automatic matching search by three modes: "only these elements", "at least these elements", and "chemical formula"
 - **Paginated browsing**: Search results are displayed 10 per page, with `nextp` / `lastp` page turning
 - **Index reference**: Directly reference the index in search results to obtain a CIF or rendered image
+- **AI message listening**: Optionally use DeepSeek to analyze group chat messages and automatically recognize crystal query intents in natural language
 - **Cooldown mechanism**: Timed independently per group chat to prevent abuse
-- **Admin commands**: Support group-level switches and cooldown reset
+- **Admin commands**: Support group-level switches, cooldown reset, and AI listening toggle
 
 ---
 
@@ -31,8 +33,11 @@ pip install nonebot2 nonebot-adapter-onebot
 ### 2. Install plugin dependencies
 
 ```bash
-pip install mp-api pymatgen
+pip install mp-api pymatgen openai
 ```
+
+- `mp-api` / `pymatgen`: Materials Project API and crystallography utilities
+- `openai`: Used to call the DeepSeek API via the OpenAI-compatible interface (for AI listening)
 
 ### 3. Install VESTA
 
@@ -57,7 +62,9 @@ your_bot_project/
 │       ├── render_vesta.py
 │       ├── search.py
 │       ├── cooldown.py
-│       └── admin.py
+│       ├── admin.py
+│       ├── watch.py
+│       └── ai_watcher.py
 ├── .env
 └── pyproject.toml
 ```
@@ -91,6 +98,10 @@ IMAGE_TIMEOUT=30
 
 # Search results per page (optional, default 10)
 SEARCH_PAGE_SIZE=10
+
+# DeepSeek API Key (optional, required for the AI message listening feature)
+# Apply at https://platform.deepseek.com/
+DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx
 ```
 
 The configuration fields are automatically mapped to the `Config` model in `config.py` (NoneBot2 automatically converts environment variable names to lowercase field names).
@@ -106,8 +117,9 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 | Command | Description |
 |---|---|
 | `/mp <material_id>` | Get the symmetrized CIF file for the specified material |
-| `/mp.prev <material_id>` | Render the crystal structure image in the default view |
+| `/mp.prev <material_id>` | Render the crystal structure image projected along the default (113) plane |
 | `/mp.prev <material_id> <view>` | Render a projection along the specified crystal plane (e.g., `011`, `111`) |
+| `/mp.prev <material_id> tri` | Three-view mode: send three images along (100), (010), and (001) in sequence |
 | `/mp.help` | Show the command index |
 
 ### Search and Reference
@@ -117,8 +129,9 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 | `/mp.search <condition>` | Search materials, 10 per page |
 | `nextp` / `lastp` | Page turning (no @, no `/`, no cooldown) |
 | `/mp.res <index>` | Get the CIF for the specified index in the search results |
-| `/mp.res.prev <index>` | Render the default view for the specified index in the search results |
+| `/mp.res.prev <index>` | Render the default (113) view for the specified index in the search results |
 | `/mp.res.prev <index> <view>` | Render a projection image for the specified index in the search results |
+| `/mp.res.prev <index> tri` | Render the three-view for the specified index in the search results |
 | `/mp.res.CLR` | Clear the search results for this group |
 
 **Automatic search condition matching rules:**
@@ -131,20 +144,61 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 | `Fe,Co,Ni` | At least these elements | The material contains at least Fe, Co, and Ni |
 | `Fe2O3` | Chemical formula | Exact match by chemical formula |
 
+**Search results table format:**
+
+```
+| # | Experimental | Materials ID | Formula | Space Group | Sites |
+| --- | --- | --- | --- | --- | --- |
+| 1 | * | mp-162 | SiO2 | P3_121 | 9 |
+| 2 |  | mp-554215 | K2Si4O9 | P6/mmm | 30 |
+...
+
+Page 1 of 5
+```
+
+> Note: The bot's actual output uses Chinese headers (`序号` / `是否测得` / `化学式` / `空间群` / `原子数`). The English version above is for reference only.
+
 ### Admin Commands
 
 | Command | Description |
 |---|---|
 | `/mp.SWT` | Toggle the plugin enabled/disabled state for this group (enabled by default) |
 | `/mp.CD` | Reset all cooldown timers in this group to zero |
+| `/mp.WATCH` | Toggle the AI message listening state for this group (disabled by default) |
 
 ### Cooldown Mechanism
 
 - `/mp` and `/mp.prev` **share** one cooldown timer, with a duration of **1 minute**
 - `/mp.search` has a separate timer, with a duration of **1 minute**
-- `/mp.res` and `/mp.res.prev` share one cooling timer, which limits the number of calls to **no more than 3 times per 1 minute**
+- `/mp.res` and `/mp.res.prev` share a **sliding-window** timer, limiting the number of calls to **no more than 3 times per 1 minute** (starting from the first call)
 - Cooldowns are **calculated independently per group chat**
 - The page-turning commands `nextp` / `lastp` have **no cooldown**
+- Calls triggered by AI listening **do not consume cooldowns**
+
+### AI Message Listening
+
+Once `/mp.WATCH` is enabled, the plugin listens to messages in the group chat and hands them to DeepSeek to determine whether they contain a crystal query intent.
+
+**Natural-language examples:**
+
+| Group message | What the AI invokes |
+|---|---|
+| `查 YBa2Cu3O7 的结构` | `/mp.search YBa2Cu3O7` |
+| `@bot 查 SiO2 的结构` | `/mp.search SiO2` |
+| `给出 7 号沿 122 晶面的投影` | `/mp.res.prev 7 122` + `/mp.res 7` |
+| `查 12 号的结构` | `/mp.res.prev 12` + `/mp.res 12` |
+| `mp-162 长什么样` | `/mp.prev mp-162` |
+
+**Notification**: Before invoking a command, the AI sends a message in the form `正在调用 /mp.search SiO2` (announcing the command being invoked).
+
+**Filter rules:**
+
+- `@bot` messages are **not subject to the length limit**
+- Non-`@bot` messages **over 100 characters are skipped**
+- Messages that are themselves MP commands (e.g., `@bot /mp.search SiO2`) **skip AI analysis** and are executed directly by the command mechanism
+- Empty messages are skipped
+
+> Note: The AI listening feature requires `DEEPSEEK_API_KEY` to be configured. Without it, enabling the switch produces no output.
 
 ---
 
@@ -158,7 +212,9 @@ materials_project/
 ├── render_vesta.py    # VESTA rendering and image export
 ├── search.py          # Search result cache and pagination management
 ├── cooldown.py        # Per-group cooldown management
-└── admin.py           # Group-level enable/disable state management
+├── admin.py           # Group-level enable/disable state management
+├── watch.py           # Group-level AI listening switch management
+└── ai_watcher.py      # DeepSeek calls, tool definitions, message filtering
 ```
 
 ### Module Responsibilities
@@ -167,9 +223,11 @@ materials_project/
 |---|---|
 | `mp_api.py` | Wraps `MPRester`, providing async interfaces for obtaining structures, generating CIFs, and searching materials |
 | `render_vesta.py` | Calls VESTA command line to render CIFs and export PNGs, supporting default view and crystal plane projection |
-| `search.py` | Maintains the search cache for each group chat and handles pagination formatting |
-| `cooldown.py` | Maintains two types of cooldown timers for each group chat |
+| `search.py` | Maintains the search cache for each group chat and handles pagination formatting (including the header) |
+| `cooldown.py` | Maintains the three kinds of cooldown timers for each group chat |
 | `admin.py` | Maintains the enabled state for each group chat |
+| `watch.py` | Maintains the AI listening switch state for each group chat |
+| `ai_watcher.py` | Defines DeepSeek tools, filter rules, and message analysis interfaces |
 
 ---
 
@@ -214,10 +272,15 @@ b = float(np.degrees(np.arctan2(-vx, v_z_after_x)))
 return a, b, 0.0
 ```
 
+### Default View and Three-View Mode
+
+- **Default view**: When `view` is not specified, the structure is projected along the (113) plane
+- **Three-view mode**: When `view` is `tri` (case-insensitive), three projection images along (100), (010), and (001) are rendered and sent in sequence
+
 ### Known Limitations
 
 - VESTA's `-export_img` parameter only exports the image and **does not make the program exit automatically**, so the plugin **actively terminates the VESTA process** after detecting that the PNG has been generated.
-- VESTA's command line only exposes `-rotate_x/y/z` Euler angle parameters and **cannot directly specify the `[hkl]` normal direction**. The crystal plane projection in the plugin uses heuristic approximate rotation; precise alignment requires a preset `.vesta` template file (not implemented yet).
+- VESTA's command line only exposes `-rotate_x/y/z` Euler angle parameters. The plugin converts the `(hkl)` normal direction into rotation angles via inverse trigonometry to achieve precise alignment; however, if VESTA's rotation convention (right-hand rule / application order) differs from the derivation, the result may be reversed or slightly skewed.
 - Linux headless servers require an `Xvfb` virtual display:
 
   ```bash
@@ -225,6 +288,19 @@ return a, b, 0.0
   ```
 
   Or add `["xvfb-run", "-a"]` before the `Popen` arguments in `render_vesta.py`.
+
+---
+
+## Obtaining a DeepSeek API Key
+
+1. Visit the [DeepSeek Open Platform](https://platform.deepseek.com/).
+2. Register and log in.
+3. In the left menu, open **"API keys"** → click **"Create API KEY"**.
+4. Enter a name (e.g., `nonebot-mp`) and click create.
+5. **Copy the generated key immediately** (in the form `sk-xxxxxxxx`); after closing the dialog, the full key cannot be viewed again.
+6. A top-up may be required before using the API (billed per token).
+
+> This plugin uses the standard OpenAI-compatible interface to call DeepSeek and does **not** require any skill files — the tool definitions are written directly in the `TOOLS` list in `ai_watcher.py`.
 
 ---
 
@@ -237,6 +313,16 @@ The Materials Project SDK is not installed. Run the following in your virtual en
 
 ```bash
 pip install mp-api pymatgen
+```
+</details>
+
+<details>
+<summary><b>Plugin loading reports <code>No module named 'openai'</code></b></summary>
+
+The OpenAI SDK (used for calling DeepSeek) is not installed. Run:
+
+```bash
+pip install openai
 ```
 </details>
 
@@ -272,6 +358,25 @@ The Materials Project API has removed the `is_experimental` field and uses `theo
 Check whether the `_check_enabled_and_cooldown` function receives the `bot` parameter and uses `bot.send(event, ...)` instead of `event.bot.send(...)`. `GroupMessageEvent` does not have a `.bot` attribute.
 </details>
 
+<details>
+<summary><b>No output from AI listening after enabling <code>/mp.WATCH</code></b></summary>
+
+Troubleshoot in this order:
+
+1. Confirm `DEEPSEEK_API_KEY` is correctly configured in `.env` and that the bot has been **restarted**.
+2. Confirm that `@bot /mp.WATCH` has been sent in the group and that the bot replied `AI 消息监听已开启`.
+3. Check whether the message was filtered (too long, or an `/mp*` command).
+4. Temporarily add a `logger.info` line inside `handle_ai_watch` to see whether the switch, the filter, or the API call is blocking the message.
+</details>
+
+<details>
+<summary><b>AI listening triggers too often / on irrelevant messages</b></summary>
+
+- If every message is being sent to the AI, consider adding a keyword pre-filter inside `should_analyze` (e.g., only send messages containing words like "查/结构/CIF/投影/晶面/号").
+- If a few unrelated messages trigger commands, keep `tool_choice="auto"` but tighten the system prompt in `analyze_message`.
+- Disable `/mp.WATCH` to completely stop AI listening.
+</details>
+
 ---
 
 ## Contributing
@@ -282,6 +387,7 @@ Issues and PRs are welcome. If you implement the following features, you are ver
 - [ ] Automatic adaptation for Linux + Xvfb
 - [ ] Support for more rendering backends (e.g., ASE, py3Dmol)
 - [ ] Support for filtering by space group, band gap, stability, etc.
+- [ ] Support for additional AI backends (OpenRouter, Ollama, etc.)
 
 ---
 
@@ -297,9 +403,10 @@ This project is open source under the [MIT License](LICENSE).
 - [NoneBot2](https://github.com/nonebot/nonebot2) — an excellent Python asynchronous bot framework
 - [VESTA](https://jp-minerals.org/vesta/) — a powerful crystal structure visualization tool
 - [pymatgen](https://pymatgen.org/) — a Python toolkit for materials science
+- [DeepSeek](https://platform.deepseek.com/) — provides an OpenAI-compatible inference service
 
 ---
 
 ## Disclaimer
 
-This plugin is for learning and scientific research only. When using the Materials Project API, please comply with its [Terms of Use](https://materialsproject.org/terms-of-use).
+This plugin is for learning and scientific research only. When using the Materials Project API, please comply with its [Terms of Use](https://materialsproject.org/terms-of-use). When using the DeepSeek API, please comply with its platform service terms.

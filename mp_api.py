@@ -35,10 +35,7 @@ def _sync_get_cif(material_id: str, symprec: float = 0.1) -> Optional[str]:
 
 def _parse_search_query(query: str) -> dict:
     """
-    自动解析搜索条件：
-      - 含 "-"：按 only elements 处理（chemsys），如 "Si-O"
-      - 含 ","：按 at least elements 处理（elements），如 "Si,O"
-      - 其他 ：按化学式处理（formula），如 "Fe2O3"
+    自动解析搜索条件
     """
     query = query.strip()
 
@@ -80,7 +77,7 @@ def _sync_search(query: str, num_results: int = 50) -> List[Dict[str, Any]]:
                     "formula": doc.formula_pretty,
                     "spacegroup": doc.symmetry.symbol if doc.symmetry else "N/A",
                     "nsites": doc.nsites,
-                    # theoretical=False 表示实验结构，对应原来 is_experimental=True 的逻辑
+                    # theoretical=False 表示实验结构
                     "is_experimental": not doc.theoretical,
                 })
 
