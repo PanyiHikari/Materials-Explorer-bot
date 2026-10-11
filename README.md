@@ -118,7 +118,7 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 |---|---|
 | `/mp <material_id>` | Get the symmetrized CIF file for the specified material |
 | `/mp.prev <material_id>` | Render the crystal structure image projected along the default (113) plane |
-| `/mp.prev <material_id> <view>` | Render a projection along the specified crystal plane (e.g., `011`, `111`) |
+| `/mp.prev <material_id> <hkl>` | Render a projection along the specified crystal plane (e.g., `011`, `111`) |
 | `/mp.prev <material_id> tri` | Three-view mode: send three images along (100), (010), and (001) in sequence |
 | `/mp.help` | Show the command index |
 
@@ -130,7 +130,7 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 | `nextp` / `lastp` | Page turning (no @, no `/`, no cooldown) |
 | `/mp.res <index>` | Get the CIF for the specified index in the search results |
 | `/mp.res.prev <index>` | Render the default (113) view for the specified index in the search results |
-| `/mp.res.prev <index> <view>` | Render a projection image for the specified index in the search results |
+| `/mp.res.prev <index> <hkl>` | Render a projection image for the specified index in the search results |
 | `/mp.res.prev <index> tri` | Render the three-view for the specified index in the search results |
 | `/mp.res.CLR` | Clear the search results for this group |
 
@@ -147,10 +147,10 @@ All commands respond **only when the bot is @-mentioned** (except `nextp` / `las
 **Search results table format:**
 
 ```
-| # | Experimental | Materials ID | Formula | Space Group | Sites |
+| # | Experimental | mp ID | Formula | Space Group | Sites |
 | --- | --- | --- | --- | --- | --- |
 | 1 | * | mp-162 | SiO2 | P3_121 | 9 |
-| 2 |  | mp-554215 | K2Si4O9 | P6/mmm | 30 |
+| 2 |   | mp-554215 | K2Si4O9 | P6/mmm | 30 |
 ...
 
 Page 1 of 5
@@ -274,8 +274,8 @@ return a, b, 0.0
 
 ### Default View and Three-View Mode
 
-- **Default view**: When `view` is not specified, the structure is projected along the (113) plane
-- **Three-view mode**: When `view` is `tri` (case-insensitive), three projection images along (100), (010), and (001) are rendered and sent in sequence
+- **Default view**: When `hkl` is not specified, the structure is projected along the (113) plane
+- **Three-view mode**: When `hkl` is `tri` (case-insensitive), three projection images along (100), (010), and (001) are rendered and sent in sequence
 
 ### Known Limitations
 
