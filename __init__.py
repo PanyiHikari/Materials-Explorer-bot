@@ -35,6 +35,10 @@ from .ask_swt import is_ask_enabled, toggle_ask
 from .ai_watcher import ask_question
 from .ai_memory import clear_group as clear_ai_group, clear_all as clear_ai_all, stats as ai_stats
 
+from .alias_dict import add as add_alias, lookup as lookup_alias
+from .mp_api import resolve_search
+from .ask_context import get_context
+
 # 帮助信息
 
 __plugin_meta__ = PluginMetadata(
@@ -174,15 +178,34 @@ async def handle_help(bot: Bot, event: GroupMessageEvent):
     help_text = (
         "Materials Project 插件指令索引\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "/mp <material_id> - 获取 CIF 文件\n"
-        "/mp.prev <material_id> [hkl] - 渲染晶体图片，可指定投影方向\n"
-        "/mp.prev <material_id> tri - 渲染三视图\n"
-        "/mp.search <搜索条件> - 搜索晶体\n"
-        "  nextp / lastp - 翻页（无需 @）\n"
-        "/mp.res <序号> - 获取搜索结果 CIF\n"
-        "/mp.res.prev <序号> [hkl] - 渲染搜索结果图片，可指定投影方向\n"
-        "/mp.res.prev <序号> tri - 渲染搜索结果三视图\n"
-        "/mp.res.CLR - 清除搜索结果"
+        "【查询】\n"
+        "/mp <material_id>                  获取对称化 CIF 文件\n"
+        "/mp.prev <material_id> [hkl|tri]   渲染晶体投影图(可指定投影方向和三视图)\n"
+        "\n"
+        "【搜索与引用】\n"
+        "/mp.search <条件>                  搜索晶体\n"
+        "  nextp / lastp                    翻页(无需 @)\n"
+        "/mp.res <序号>                     获取搜索结果 CIF\n"
+        "/mp.res.prev <序号> [hkl|tri]      渲染搜索结果投影图(可指定投影方向和三视图)\n"
+        "/mp.res.CLR                        清除本群搜索结果\n"
+        "\n"
+        "【搜索条件写法】\n"
+        "  Si-O        仅含 Si 和 O (用 - 连接)\n"
+        "  Si,O        至少含 Si 和 O (用 , 连接)\n"
+        "  Fe2O3       按化学式精确匹配\n"
+        "  萤石        若已在别名字典中，直接查询别名\n"
+        "\n"
+        "【问答】\n"
+        "/mp.ask <问题>                     询问晶体学或材料学问题\n"
+        "  如：/mp.ask 这个晶体属于什么晶系\n"
+        "  如：/mp.ask 详细解释为什么它是四方晶系\n"
+        "\n"
+        "【别名字典】\n"
+        "/mp.dict <别名> [mp ID]            关联别名与晶体\n"
+        "  不填 mp ID 时使用本群最近查询的晶体\n"
+        "\n"
+        "【对话记忆】\n"
+        "/mp.ai.CLR                         清除本群 AI 对话记忆\n"
     )
     await bot.send(event, help_text)
 
@@ -224,24 +247,21 @@ async def handle_mp_search(bot: Bot, event: GroupMessageEvent, args: Message = C
         return
     query = args.extract_plain_text().strip()
     if not query:
-        await bot.send(event, 
-            "请提供搜索条件喵：\n"
-            "  only:Si,O        —— 仅含 Si 和 O\n"
-            "  atleast:Si,O     —— 至少含 Si 和 O\n"
-            "  formula:Fe2O3    —— 化学式为 Fe2O3"
-        )
+        await bot.send(event, "请提供搜索条件喵")
         return
 
     group_id = _get_group_id(event)
     clear_cache(group_id)
 
     await bot.send(event, f"正在搜索：{query} ...")
-    results = await search_materials(query, num_results=50)
+    results, hit_alias = await resolve_search(query, num_results=50)
     if not results:
-        await bot.send(event, "没找到符合条件的晶体喵")
+        await bot.send(event, "未找到符合条件的晶体喵")
         return
 
     cache = set_cache(group_id, results, query)
+    if hit_alias:
+        await bot.send(event, f"命中别名字典「{query}」，共 {len(results)} 个条目：")
     await bot.send(event, cache.format_page())
 
 # nextp / lastp
@@ -335,6 +355,43 @@ async def handle_mp_res_clr(bot: Bot, event: GroupMessageEvent):
     group_id = _get_group_id(event)
     clear_cache(group_id)
     await bot.send(event, "搜索结果已清除喵")
+
+# /mp.dict
+
+mp_dict_cmd = on_command("mp.dict", rule=to_me(), priority=10, block=True)
+
+@mp_dict_cmd.handle()
+async def handle_mp_dict(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
+    group_id = _get_group_id(event)
+    if not is_enabled(group_id):
+        await bot.send(event, "mp 指令已禁用")
+        return
+
+    text = args.extract_plain_text().strip()
+    parts = text.split()
+    if not parts:
+        await bot.send(event, "用法：/mp.dict <别名> [mp ID]\n未填 mp ID 时使用本群最近查询的晶体。")
+        return
+
+    alias = parts[0]
+    if len(parts) >= 2:
+        material_id = parts[1]
+    else:
+        ctx = get_context(group_id)
+        if ctx is None:
+            await bot.send(event, "未提供 mp ID，且本群无最近查询的晶体。请明确指定，如：/mp.dict 石英 mp-6930")
+            return
+        material_id = ctx.material_id
+
+    if not re.match(r"^mp-\d+$", material_id):
+        await bot.send(event, f"无效的 mp ID：{material_id}")
+        return
+
+    if add_alias(alias, material_id):
+        aliases = ", ".join(lookup_alias(alias))
+        await bot.send(event, f"已将「{alias}」关联到 {material_id}。\n当前「{alias}」对应：{aliases}")
+    else:
+        await bot.send(event, "写入别名字典失败，请查看后台日志。")
 
 # 管理指令
 
@@ -471,11 +528,13 @@ async def _dispatch_ai_call(
             if not query:
                 return
             clear_cache(group_id)
-            results = await search_materials(query, num_results=50)
+            results, hit_alias = await resolve_search(query, num_results=50)
             if not results:
                 await bot.send(event, f"未找到匹配 {query} 的晶体。")
                 return
             cache = set_cache(group_id, results, query)
+            if hit_alias:
+                await bot.send(event, f"命中别名字典「{query}」，共 {len(results)} 个条目：")
             await bot.send(event, cache.format_page())
 
         elif name == "mp_get_cif":
@@ -539,6 +598,25 @@ async def _dispatch_ai_call(
             if not question:
                 return
             await ask_question(bot, event, question)
+
+        elif name == "mp_add_alias":
+            alias = args.get("alias", "").strip()
+            material_id = args.get("material_id", "").strip()
+            if not alias:
+                return
+            if not material_id:
+                ctx = get_context(group_id)
+                if ctx is None:
+                    await bot.send(event, "未指定 mp ID，且本群无最近查询的晶体。")
+                    return
+                material_id = ctx.material_id
+            if not re.match(r"^mp-\d+$", material_id):
+                await bot.send(event, f"无效的 mp ID：{material_id}")
+                return
+            if add_alias(alias, material_id):
+                await bot.send(event, f"已将「{alias}」关联到 {material_id}")
+            else:
+                await bot.send(event, "写入别名字典失败。")
 
         else:
             logger.warning(f"AI 返回了未知工具: {name}")

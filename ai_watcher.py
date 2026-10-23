@@ -38,13 +38,23 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "mp_search",
-            "description": "在 Materials Project 中搜索晶体材料。当用户想查某个化学式或元素组合的结构时使用。",
+            "description": (
+                "在 Materials Project 中搜索晶体材料。当用户想查某个化学式、元素组合，"
+                "或者**某个物质名称/俗名/别名（如'萤石'、'石英'、'金红石'）**时使用。"
+                "**如果用户使用的是物质名称/别名，必须原样作为 query 传递，"
+                "不要翻译为化学式**——插件会自动查别名字典并返回对应的晶体列表。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "搜索条件。用 '-' 连接表示仅含这些元素（如 Si-O），用 ',' 连接表示至少含这些元素（如 Si,O），直接写化学式表示精确匹配（如 YBa2Cu3O7）。",
+                        "description": (
+                            "搜索条件。用 '-' 连接表示仅含这些元素（如 Si-O），"
+                            "用 ',' 连接表示至少含这些元素（如 Si,O），"
+                            "直接写化学式表示精确匹配（如 YBa2Cu3O7），"
+                            "或者直接写物质别名（如 '萤石'）。"
+                        ),
                     }
                 },
                 "required": ["query"],
@@ -119,11 +129,30 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "mp_search_for_ask",
-            "description": "当用户问题中指定了一个与当前晶体不同的化学式时，搜索该化学式。",
+            "description": (
+                "在 Materials Project 中搜索晶体材料，用于 /mp.ask 问答过程中需要"
+                "定位某个晶体的场景。当问题中指定了一个与当前晶体不同的化学式、"
+                "元素组合，或者**某个物质名称/俗名/别名（如'萤石'、'石英'、'金红石'）**时使用。"
+                "**如果用户使用的是物质名称/别名，必须原样作为 formula 参数传递，"
+                "不要翻译为化学式，不要替换为其他名称**——插件会自动查别名字典并返回"
+                "对应的晶体列表，再由用户从中选择。"
+                "注意：调用本工具后，程序会发送'你要查以下哪个晶体？'和搜索结果，"
+                "并中止本轮问答等待用户选择，因此不要在调用本工具后继续生成最终回答。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "formula": {"type": "string", "description": "化学式，如 SiO2"}
+                    "formula": {
+                        "type": "string",
+                        "description": (
+                            "搜索条件。支持以下写法："
+                            "1) 用 '-' 连接表示仅含这些元素，如 'Si-O'、'Li-Fe-P-O'；"
+                            "2) 用 ',' 连接表示至少含这些元素，如 'Si,O'、'Fe,Co,Ni'；"
+                            "3) 直接写化学式表示精确匹配，如 'YBa2Cu3O7'、'CaF2'；"
+                            "4) 直接写物质名称/俗名/别名（原样传递，不要翻译），"
+                            "如 '萤石'、'石英'、'金红石'。"
+                        ),
+                    }
                 },
                 "required": ["formula"],
             },
@@ -166,6 +195,25 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mp_add_alias",
+            "description": (
+                "把别名关联到某个 mp ID。当用户说'记住 X 就是 mp-xxx'、"
+                "'X 的 ID 是 mp-xxx'、'以后 X 就查 mp-xxx'时使用。"
+                "若不填 material_id，则使用本群最近查询的晶体。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alias": {"type": "string", "description": "别名，如'石英'"},
+                    "material_id": {"type": "string", "description": "mp ID，如 mp-6930"},
+                },
+                "required": ["alias"],
+            },
+        },
+    },
 ]
 
 
@@ -186,7 +234,34 @@ def _looks_like_mp_command(text: str) -> bool:
                 return True
     return False
 
-_ASK_KEYWORDS = ("对称", "旋转", "反轴", "映轴", "螺旋轴", "镜面", "反映", "反演", "滑移", "次轴", "晶系", "晶族", "空间群", "为什么", "在哪", "投影", "配位", "多面体", "晶胞", "点群", "键长", "占位率")
+def _get_alias_hint(text: str) -> str:
+    """
+    扫描文本中出现的所有别名，生成一段提示，附加到 system prompt 中。
+    目的是让 AI 知道这些词是别名，调用 mp_search 时必须原样传递，
+    而不是翻译成化学式（如"萤石"→"CaF2"）。
+    """
+    from .alias_dict import all_aliases
+
+    aliases = all_aliases()
+    if not aliases:
+        return ""
+
+    text_lower = text.lower()
+    hits = [a for a in aliases if a and a.lower() in text_lower]
+    if not hits:
+        return ""
+
+    hit_str = "、".join(f"「{h}」" for h in hits)
+    return (
+        f"\n\n**重要提示**：用户消息中出现了别名字典中的词 {hit_str}。"
+        "调用 mp_search 或 mp_search_for_ask 时，必须把这些别名**原样**作为 "
+        "query / formula 参数传递，**不要翻译为化学式，不要替换为其他名称**。"
+        "插件会自动查别名字典并返回对应的晶体列表。"
+    )
+
+_ASK_KEYWORDS = (
+    "对称", "旋转", "反轴", "映轴", "螺旋轴", "镜面", "反映", "反演", "滑移", "次轴", "晶系", "晶族", "空间群", "为什么", "在哪", "投影", "配位", "多面体", "晶胞", "点群", "键长", "占位率", "记住", "别名", "俗称", "关联", "就是",
+)
 
 def should_analyze(text: str, is_at_bot: bool) -> bool:
     """
@@ -226,23 +301,24 @@ async def analyze_message(
         return None
 
     try:
+        system_content = (
+            "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。"
+            "如果用户表达了查询意图，调用相应的工具；否则不要调用任何工具。"
+            "注意：'第 N 号'、'N 号'中的 N 是搜索结果中的序号，"
+            "对应 mp_res_cif / mp_res_prev 的 index 参数。"
+            "如果用户同时想要 CIF 文件和结构图，可以同时调用 mp_res_cif 和 mp_res_prev。"
+            "如果消息是简短的追问（如'那它呢'、'第二个呢'、'为什么'），"
+            "请结合下文的历史对话理解其指代对象。"
+            "对于晶体学问答类问题（如'属于什么晶系'、'4 次轴在哪里'、"
+            "'为什么具有这个对称性'），调用 ask_question 工具。"
+        )
+        # 别名提示：如果消息里出现字典中的别名，要求 AI 原样传递
+        system_content += _get_alias_hint(text)
+
         messages: List[Dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。"
-                    "如果用户表达了查询意图，调用相应的工具；否则不要调用任何工具。"
-                    "注意：'第 N 号'、'N 号'中的 N 是搜索结果中的序号，对应 mp_res_cif / mp_res_prev 的 index 参数。"
-                    "如果用户同时想要 CIF 文件和结构图，可以同时调用 mp_res_cif 和 mp_res_prev。"
-                    "如果消息是简短的追问（如'那它呢'、'第二个呢'、'为什么'），"
-                    "请结合下文的历史对话理解其指代对象。"
-                    "对于晶体学问答类问题（如'属于什么晶系'、'4 次轴在哪里'、'为什么具有这个对称性'），"
-                    "调用 ask_question 工具。"
-                ),
-            }
+            {"role": "system", "content": system_content}
         ]
 
-        # 注入最近 3 轮历史，帮助理解指代
         if group_id:
             for turn in get_history(group_id, max_turns=3):
                 messages.append({"role": "user", "content": turn.user})
@@ -380,10 +456,14 @@ async def ask_question(bot, event, question: str):
         "4. 如果问题中明确提到 material_id（如 mp-390），"
         "必须调用 mp_get_structure_info(material_id) 获取该晶体的数据。\n"
         "5. 如果当前晶体为'无'且问题中没有明确 material_id，"
-        "根据化学式调用 mp_search_for_ask。\n\n"
+        "根据化学式调用 mp_search_for_ask。\n"
+        "6. 如果问题中使用'它'、'这个晶体'、'刚才那个'等指代词，"
+        "请结合上文对话历史理解指代对象。\n\n"
         f"{current_section}\n\n"
         f"## 参考资料\n{skill_text}"
     )
+    # 别名提示
+    system_prompt += _get_alias_hint(question)
 
     # 4. 构造 message, 含历史
 
@@ -461,12 +541,15 @@ async def ask_question(bot, event, question: str):
                         "content": "化学式为空",
                     })
                     continue
+                from .mp_api import resolve_search
                 clear_cache(group_id)
-                results = await search_materials(formula, num_results=50)
+                results, hit_alias = await resolve_search(formula, num_results=50)
                 if not results:
                     await bot.send(event, f"未找到化学式 {formula} 的晶体。")
                     return
                 cache = set_cache(group_id, results, formula)
+                if hit_alias:
+                    await bot.send(event, f"命中别名字典「{formula}」，共 {len(results)} 个条目：")
                 await bot.send(event, "你要查以下哪个晶体？")
                 await bot.send(event, cache.format_page())
                 return

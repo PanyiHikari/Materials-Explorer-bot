@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from mp_api.client import MPRester
 from pymatgen.core import Structure
@@ -180,3 +180,64 @@ def _sync_get_structure_info(material_id: str) -> Optional[Dict[str, Any]]:
 
 async def get_structure_info(material_id: str) -> Optional[Dict[str, Any]]:
     return await asyncio.to_thread(_sync_get_structure_info, material_id)
+
+def _sync_get_materials_summary(material_ids: List[str]) -> List[Dict[str, Any]]:
+    """根据一组 mp ID 批量获取搜索摘要，保持输入顺序"""
+    if not material_ids:
+        return []
+    results: List[Dict[str, Any]] = []
+    try:
+        with MPRester(config.mp_api_key) as mpr:
+            docs = mpr.materials.summary.search(
+                material_ids=list(material_ids),
+                fields=[
+                    "material_id",
+                    "formula_pretty",
+                    "symmetry",
+                    "nsites",
+                    "theoretical",
+                ],
+                num_chunks=1,
+                chunk_size=max(len(material_ids), 10),
+            )
+            doc_map = {str(d.material_id): d for d in docs}
+            for mid in material_ids:
+                d = doc_map.get(mid)
+                if d is None:
+                    continue
+                results.append({
+                    "material_id": str(d.material_id),
+                    "formula": d.formula_pretty,
+                    "spacegroup": d.symmetry.symbol if d.symmetry else "N/A",
+                    "nsites": d.nsites,
+                    "is_experimental": not d.theoretical,
+                })
+    except Exception as e:
+        logger.opt(exception=e).error("批量获取材料摘要失败")
+    return results
+
+
+async def get_materials_summary(material_ids: List[str]) -> List[Dict[str, Any]]:
+    return await asyncio.to_thread(_sync_get_materials_summary, material_ids)
+
+
+async def resolve_search(
+    query: str,
+    num_results: int = 50,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    统一搜索入口：
+      1. 先查别名字典，命中则返回字典里所有 mp ID 的摘要
+      2. 否则调用 MP API 搜索
+    Returns:
+        (results, hit_alias)
+    """
+    from .alias_dict import lookup
+
+    alias_mids = lookup(query)
+    if alias_mids:
+        results = await get_materials_summary(alias_mids)
+        return results, True
+
+    results = await search_materials(query, num_results)
+    return results, False
