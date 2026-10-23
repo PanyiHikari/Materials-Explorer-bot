@@ -1,0 +1,74 @@
+name: Merge Community Alias Dictionary
+
+on:
+  pull_request:
+    paths:
+      - 'community/**/*.json'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Validate community JSON files
+        run: |
+          set -e
+          for f in community/*.json; do
+            echo "Validating $f"
+            # 1) 必须是合法 JSON
+            jq empty "$f"
+            # 2) 顶层必须是对象
+            if [ "$(jq 'type' "$f")" != '"object"' ]; then
+              echo "::error file=$f::顶层必须是 JSON 对象"
+              exit 1
+            fi
+            # 3) 每个值必须是字符串数组
+            if ! jq -e 'all(.[]; type == "array" and all(.[]; type == "string"))' "$f"; then
+              echo "::error file=$f::每个别名的值必须是 mp ID 字符串数组"
+              exit 1
+            fi
+          done
+
+      - name: Merge into alias_dict.json (append strategy)
+        run: |
+          set -e
+          # 以现有主字典为起点
+          cp alias_dict.json merged.json
+          for f in community/*.json; do
+            echo "Merging $f"
+            # 对每个社区文件：已有的别名追加 ID（去重），新别名直接加入
+            jq -s '
+              .[0] as $base | .[1] as $patch |
+              $base as $b |
+              reduce ($patch | keys[]) as $k (
+                $b;
+                if has($k)
+                then .[$k] = ((.[$k] + $patch[$k]) | unique)
+                else .[$k] = $patch[$k]
+                end
+              )
+            ' merged.json "$f" > tmp.json && mv tmp.json merged.json
+          done
+          # 格式化输出
+          jq --indent 2 --sort-keys . merged.json > alias_dict.json
+
+      - name: Commit merged alias_dict.json back to PR
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add alias_dict.json
+          if git diff --cached --quiet; then
+            echo "alias_dict.json 无变化"
+          else
+            git commit -m "chore: auto-merge community alias dictionary"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
