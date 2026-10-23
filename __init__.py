@@ -22,7 +22,18 @@ from .cooldown import cooldown_mgr
 from .admin import is_enabled, toggle
 
 from .watch import is_watch_enabled, toggle_watch
-from .ai_watcher import should_analyze, analyze_message
+from .ai_watcher import (
+    should_analyze,
+    analyze_message,
+    _format_structure_for_prompt,
+    ask_question,
+)
+
+from .ask_context import set_context
+from .ask_context import get_context, set_context
+from .ask_swt import is_ask_enabled, toggle_ask
+from .ai_watcher import ask_question
+from .ai_memory import clear_group as clear_ai_group, clear_all as clear_ai_all, stats as ai_stats
 
 # 帮助信息
 
@@ -52,6 +63,7 @@ async def _send_cif(bot: Bot, event: GroupMessageEvent, material_id: str):
         f.write(cif_text)
 
     try:
+        set_context(_get_group_id(event), material_id)
         await bot.call_api(
             "upload_group_file",
             group_id=event.group_id,
@@ -93,6 +105,7 @@ async def _send_vesta_image(
         try:
             with open(png_path, "rb") as f:
                 image_data = f.read()
+            set_context(_get_group_id(event), material_id)
             await bot.send(event, MessageSegment.image(image_data))
         finally:
             try:
@@ -354,6 +367,25 @@ async def handle_mp_watch(bot: Bot, event: GroupMessageEvent):
     state_text = "开启" if new_state else "关闭"
     await bot.send(event, f"{state_text} AI 消息监听了喵")
 
+# /mp.ai.CLR
+
+mp_ai_clr_cmd = on_command("mp.ai.CLR", rule=to_me(), priority=5, block=True)
+
+@mp_ai_clr_cmd.handle()
+async def handle_mp_ai_clr(bot: Bot, event: GroupMessageEvent):
+    group_id = _get_group_id(event)
+    n = clear_ai_group(group_id)
+    await bot.send(event, f"本群 AI 记忆已清除（共 {n} 轮）")
+
+# /mp.ai.CLRALL
+
+mp_ai_clrall_cmd = on_command("mp.ai.CLRALL", rule=to_me(), priority=5, block=True)
+
+@mp_ai_clrall_cmd.handle()
+async def handle_mp_ai_clrall(bot: Bot, event: GroupMessageEvent):
+    n = clear_ai_all()
+    await bot.send(event, f"已清除全部 AI 记忆（共 {n} 个群）")
+
 # AI 消息监听
 
 ai_watch_msg = on_message(priority=20, block=False)
@@ -377,7 +409,7 @@ async def handle_ai_watch(bot: Bot, event: GroupMessageEvent):
         return
 
     # 调用 AI 分析
-    calls = await analyze_message(plain)
+    calls = await analyze_message(plain, group_id=group_id)
     if not calls:
         return
 
@@ -479,8 +511,67 @@ async def _dispatch_ai_call(
             view = args.get("view")
             await _send_vesta_image(bot, event, result["material_id"], view)
 
+        elif name == "ask_question":
+            if not is_ask_enabled(group_id):
+                await bot.send(event, "/mp.ask 指令已禁用")
+                return
+            await ask_question(bot, event, args["question"])
+
+        elif name == "mp_get_structure_info":
+            material_id = args.get("material_id", "").strip()
+            if not material_id:
+                return
+            from .mp_api import get_structure_info
+            data = await get_structure_info(material_id)
+            if data is None:
+                await bot.send(event, f"未能获取 {material_id} 的结构数据。")
+            else:
+                formatted = _format_structure_for_prompt(data)
+                # 群消息长度限制，分片发送
+                for i in range(0, len(formatted), 1500):
+                    await bot.send(event, formatted[i:i + 1500])
+
+        elif name == "ask_question":
+            if not is_ask_enabled(group_id):
+                await bot.send(event, "/mp.ask 指令已禁用")
+                return
+            question = args.get("question", "").strip()
+            if not question:
+                return
+            await ask_question(bot, event, question)
+
         else:
             logger.warning(f"AI 返回了未知工具: {name}")
 
     except Exception as e:
         logger.error(f"执行 AI 指令 {name} 失败: {e}", exc_info=True)
+
+mp_ask_cmd = on_command("mp.ask", rule=to_me(), priority=10, block=True)
+
+@mp_ask_cmd.handle()
+async def handle_mp_ask(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
+    group_id = _get_group_id(event)
+
+    if not is_enabled(group_id):
+        await bot.send(event, "mp 指令已禁用喵")
+        return
+
+    if not is_ask_enabled(group_id):
+        await bot.send(event, "/mp.ask 指令已禁用喵")
+        return
+
+    question = args.extract_plain_text().strip()
+    if not question:
+        await bot.send(event, "请提供问题喵, 例如: /mp.ask 这个晶体的 4 次旋转轴在哪里?")
+        return
+
+    await ask_question(bot, event, question)
+
+mp_ask_swt_cmd = on_command("mp.ask.SWT", rule=to_me(), priority=5, block=True)
+
+@mp_ask_swt_cmd.handle()
+async def handle_mp_ask_swt(bot: Bot, event: GroupMessageEvent):
+    group_id = _get_group_id(event)
+    new_state = toggle_ask(group_id)
+    state_text = "启用" if new_state else "禁用"
+    await bot.send(event, f"/mp.ask 指令已{state_text}喵")

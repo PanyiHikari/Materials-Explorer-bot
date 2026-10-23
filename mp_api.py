@@ -96,3 +96,87 @@ async def get_cif(material_id: str, symprec: float = 0.1) -> Optional[str]:
 
 async def search_materials(query: str, num_results: int = 50) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_sync_search, query, num_results)
+
+def _sync_get_structure_info(material_id: str) -> Optional[Dict[str, Any]]:
+    """
+    获取指定晶体的完整结构信息
+    """
+    try:
+        with MPRester(config.mp_api_key) as mpr:
+            structure = mpr.get_structure_by_material_id(material_id)
+            if structure is None:
+                return None
+
+            try:
+                summary = mpr.materials.summary.search(
+                    material_id=material_id,
+                    fields=["symmetry", "formula_pretty", "nsites",
+                            "is_stable", "band_gap", "density", "volume"],
+                )
+                info = summary[0] if summary else None
+            except Exception:
+                info = None
+
+            lat = structure.lattice
+            sites = []
+            for site in structure:
+                # pymatgen 中占位率存放在 site.species（Composition）里
+                species_dict = {
+                    str(el): round(float(occ), 4)
+                    for el, occ in site.species.items()
+                    if occ > 1e-6
+                }
+                # 主元素（占位率最高的那个）用于展示
+                if species_dict:
+                    main_el, main_occ = max(species_dict.items(), key=lambda kv: kv[1])
+                else:
+                    main_el, main_occ = str(site.specie), 1.0
+
+                sites.append({
+                    "element": main_el,
+                    "species": species_dict,              # 所有元素 + 占位率
+                    "fractional_coords": [round(float(x), 6) for x in site.frac_coords],
+                    "cartesian_coords": [round(float(x), 6) for x in site.coords],
+                    "occupancy": main_occ,                # 兼容旧字段
+                })
+
+            result: Dict[str, Any] = {
+                "material_id": material_id,
+                "formula": structure.composition.reduced_formula,
+                "full_formula": structure.composition.formula,
+                "nsites": len(structure),
+                "lattice": {
+                    "a": round(float(lat.a), 6),
+                    "b": round(float(lat.b), 6),
+                    "c": round(float(lat.c), 6),
+                    "alpha": round(float(lat.alpha), 4),
+                    "beta": round(float(lat.beta), 4),
+                    "gamma": round(float(lat.gamma), 4),
+                    "volume": round(float(lat.volume), 4),
+                },
+                "sites": sites,
+            }
+
+            if info is not None:
+                if getattr(info, "symmetry", None):
+                    sym = info.symmetry
+                    result["spacegroup_symbol"] = sym.symbol
+                    result["spacegroup_number"] = sym.number
+                    result["point_group"] = sym.point_group
+                    cs = getattr(sym, "crystal_system", None)
+                    result["crystal_system"] = cs.value if hasattr(cs, "value") else str(cs)
+                for attr in ("density", "band_gap", "is_stable", "volume"):
+                    if hasattr(info, attr):
+                        v = getattr(info, attr)
+                        if isinstance(v, (int, float)):
+                            result[attr] = round(float(v), 4)
+
+            return result
+
+    except Exception as e:
+        logger.error(f"获取结构信息失败 {material_id}: {e}", exc_info=True)
+        return None
+
+
+async def get_structure_info(material_id: str) -> Optional[Dict[str, Any]]:
+    return await asyncio.to_thread(_sync_get_structure_info, material_id)

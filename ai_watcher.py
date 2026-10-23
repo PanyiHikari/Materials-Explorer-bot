@@ -1,10 +1,17 @@
 import json
 from typing import Optional, Dict, Any, List
+import re
 
 from nonebot.log import logger
 from openai import AsyncOpenAI
 
 from .config import config
+
+import os
+from .ask_context import get_context, set_context
+from .ask_swt import is_ask_enabled
+
+from .ai_memory import add_turn, get_history
 
 # DeepSeek 客户端(延迟初始化)
 
@@ -14,7 +21,7 @@ def _get_client() -> Optional[AsyncOpenAI]:
     global _client
     if _client is None:
         if not config.deepseek_api_key:
-            logger.warning("DEEPSEEK_API_KEY 未配置，AI 监听功能不可用")
+            logger.warning("DEEPSEEK_API_KEY 未配置, AI 监听功能不可用")
             return None
         _client = AsyncOpenAI(
             api_key=config.deepseek_api_key,
@@ -108,6 +115,57 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mp_search_for_ask",
+            "description": "当用户问题中指定了一个与当前晶体不同的化学式时，搜索该化学式。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "formula": {"type": "string", "description": "化学式，如 SiO2"}
+                },
+                "required": ["formula"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mp_prev_for_ask",
+            "description": "为当前晶体渲染沿指定晶面的投影图，用于回答对称元素位置等问题。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "material_id": {"type": "string"},
+                    "view": {"type": "string", "description": "晶面参数，如 001、111"},
+                },
+                "required": ["material_id", "view"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_question",
+            "description": (
+                "回答晶体学与材料学的问答类问题，例如'属于什么晶系'、"
+                "'4 次旋转轴在哪里'、'为什么具有这个对称性'。"
+                "会先获取结构数据再综合分析。对于纯查询类操作"
+                "（如'查 SiO2'、'发 mp-162 的 CIF'）不要用这个，直接用其他工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "用户的原始问题",
+                    }
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 
@@ -128,17 +186,11 @@ def _looks_like_mp_command(text: str) -> bool:
                 return True
     return False
 
+_ASK_KEYWORDS = ("对称", "旋转", "反轴", "映轴", "螺旋轴", "镜面", "反映", "反演", "滑移", "次轴", "晶系", "晶族", "空间群", "为什么", "在哪", "投影", "配位", "多面体", "晶胞", "点群", "键长", "占位率")
 
 def should_analyze(text: str, is_at_bot: bool) -> bool:
     """
     判断消息是否应该送给 AI 分析。
-
-    规则：
-      1. 空消息 -> 跳过
-      2. 消息本身就是一条 MP 指令（如 /mp.search SiO2）-> 跳过（由指令机制处理）
-      3. @bot 的自然语言消息 -> 送 AI（不受长度限制）
-      4. 非 @bot 消息超过 100 字符 -> 跳过
-      5. 其余 -> 送 AI
     """
     text = text.strip()
     if not text:
@@ -156,38 +208,51 @@ def should_analyze(text: str, is_at_bot: bool) -> bool:
     if len(text) > 100:
         return False
 
+    # 如果消息包含提问关键词，且 WATCH 已开启，允许送 AI
+    if not is_at_bot and any(k in text for k in _ASK_KEYWORDS):
+        return True
+
     return True
 
 
 # AI 分析
 
-async def analyze_message(text: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    把消息送给 DeepSeek 分析，返回工具调用列表。
-
-    Returns:
-        None 表示 AI 认为消息与晶体查询无关。
-        否则返回 list of {"name": "...", "arguments": {...}}
-    """
+async def analyze_message(
+    text: str,
+    group_id: str = None,
+) -> Optional[List[Dict[str, Any]]]:
     client = _get_client()
     if client is None:
         return None
 
     try:
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。"
+                    "如果用户表达了查询意图，调用相应的工具；否则不要调用任何工具。"
+                    "注意：'第 N 号'、'N 号'中的 N 是搜索结果中的序号，对应 mp_res_cif / mp_res_prev 的 index 参数。"
+                    "如果用户同时想要 CIF 文件和结构图，可以同时调用 mp_res_cif 和 mp_res_prev。"
+                    "如果消息是简短的追问（如'那它呢'、'第二个呢'、'为什么'），"
+                    "请结合下文的历史对话理解其指代对象。"
+                    "对于晶体学问答类问题（如'属于什么晶系'、'4 次轴在哪里'、'为什么具有这个对称性'），"
+                    "调用 ask_question 工具。"
+                ),
+            }
+        ]
+
+        # 注入最近 3 轮历史，帮助理解指代
+        if group_id:
+            for turn in get_history(group_id, max_turns=3):
+                messages.append({"role": "user", "content": turn.user})
+                messages.append({"role": "assistant", "content": turn.assistant})
+
+        messages.append({"role": "user", "content": text})
+
         response = await client.chat.completions.create(
             model="deepseek-chat",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。"
-                        "如果用户表达了查询意图，调用相应的工具；否则不要调用任何工具。"
-                        "注意：'第 N 号'、'N 号'中的 N 是搜索结果中的序号，对应 mp_res_cif / mp_res_prev 的 index 参数。"
-                        "如果用户同时想要 CIF 文件和结构图，可以同时调用 mp_res_cif 和 mp_res_prev。"
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
+            messages=messages,
             tools=TOOLS,
             tool_choice="auto",
         )
@@ -208,5 +273,314 @@ async def analyze_message(text: str) -> Optional[List[Dict[str, Any]]]:
         return calls if calls else None
 
     except Exception as e:
-        logger.error(f"DeepSeek 调用失败: {e}", exc_info=True)
+        logger.opt(exception=e).error("DeepSeek 调用失败")
         return None
+
+_VERBOSE_KEYWORDS = ("详细", "展开", "详述", "深入", "推理过程", "逐步", "理由", "原因")
+
+async def ask_question(bot, event, question: str):
+    """回答晶体学/材料学问题。安全处理 ctx 为空的情况。"""
+    from . import (
+        _get_group_id,
+        search_materials,
+        set_cache,
+        clear_cache,
+        _send_vesta_image,
+    )
+    from .ask_context import get_context
+    from .ask_swt import is_ask_enabled
+    from .mp_api import get_structure_info, get_cif
+
+    group_id = _get_group_id(event)
+    if not is_ask_enabled(group_id):
+        await bot.send(event, "/mp.ask 指令已禁用")
+        return
+
+    ctx = get_context(group_id)
+
+    # 1. 确定目标晶体
+    material_id_match = re.search(r"mp-\d+", question)
+    explicit_mid = material_id_match.group(0) if material_id_match else None
+
+    if explicit_mid:
+        target_mid = explicit_mid
+    elif ctx is not None:
+        target_mid = ctx.material_id
+    else:
+        target_mid = None
+
+    # 2. 构造当前晶体数据段
+    if target_mid is None:
+        current_section = (
+            "### 当前晶体: 无\n"
+            "用户未指定 material_id，且无历史上下文。"
+            "请根据用户问题中提到的化学式调用 mp_search_for_ask 搜索并询问用户。"
+        )
+    else:
+        structure_data = await get_structure_info(target_mid)
+        if structure_data:
+            current_section = _format_structure_for_prompt(structure_data)
+        else:
+            # CIF 兜底
+            current_section = f"### 当前晶体: {target_mid}\n"
+            try:
+                cif_text = await get_cif(target_mid)
+                if cif_text:
+                    from pymatgen.core import Structure as PmgStructure
+                    st = PmgStructure.from_str(cif_text, fmt="cif")
+                    current_section += (
+                        f"- 化学式: {st.composition.reduced_formula}\n"
+                        f"- 晶胞: a={st.lattice.a:.4f}, b={st.lattice.b:.4f}, "
+                        f"c={st.lattice.c:.4f}, α={st.lattice.alpha:.2f}°, "
+                        f"β={st.lattice.beta:.2f}°, γ={st.lattice.gamma:.2f}°\n"
+                        f"- 原子数: {len(st)}\n"
+                        "（注：结构信息 API 获取失败，以下数据来自 CIF 解析。）"
+                    )
+                else:
+                    current_section += "（结构数据获取失败。）"
+            except Exception as e:
+                logger.opt(exception=e).warning("CIF 兜底解析失败")
+                current_section += "（结构数据获取失败。）"
+
+    # ---------- 3. 构造 system prompt ----------
+    skill_text = _load_skill_text()
+
+    want_detail = any(k in question for k in _VERBOSE_KEYWORDS)
+
+    if want_detail:
+        length_rule = (
+            "**回答长度**：用户希望详细解释。请分点展开，给出推理依据，"
+            "但避免罗列原始数据表格。"
+        )
+    else:
+        length_rule = (
+            "**回答长度**：默认用 1–2 句话直接给出结论，"
+            "不要展开推导、不要列出数据表、不要加客套结尾。"
+            "仅当用户明确要求详细时才展开。"
+        )
+
+    system_prompt = (
+        "你是一个晶体学与材料学专家。根据下面的晶体数据和参考资料回答问题。\n\n"
+        "**回答长度**（重要）：\n"
+        "- **默认用 1–2 句话直接给出结论**，例如：\"四方晶系（空间群 P4₂/mnm，点群 4/mmm）。\"\n"
+        "- 问\"为什么\"时，只给**核心原因**（1–2 句），不展开推导过程。\n"
+        "- **仅当用户明确要求**（如\"详细解释\"、\"展开说明\"、\"为什么……请详述\"、\"写出推理过程\"）时，"
+        "才给出多段详细说明。\n"
+        "- 不要在回答里重复列出晶胞参数表或原子坐标表，这些数据你已经看过，"
+        "只在需要佐证结论时引用关键数字。\n"
+        "- 除非用户要求，不要附\"参考资料\"、\"注：\"、\"如需更多信息请……\"这类结尾。\n\n"
+        "**数据规则**：\n"
+        "1. 所有定量参数（晶胞参数、原子坐标、空间群、点群）必须来自下面的结构数据，"
+        "或通过调用 mp_get_structure_info 工具获取，**不得猜测**。\n"
+        "2. 如果问题涉及对称元素的位置（例如'4 次轴在哪里'），必须调用 "
+        "mp_prev_for_ask 工具，沿该对称元素的晶向渲染投影图，"
+        "并在文字回答中说明投影方向。\n"
+        "3. 如果问题中指定了一个与当前晶体不同的化学式，"
+        "必须先调用 mp_search_for_ask 搜索，然后询问用户选择哪一个结果。\n"
+        "4. 如果问题中明确提到 material_id（如 mp-390），"
+        "必须调用 mp_get_structure_info(material_id) 获取该晶体的数据。\n"
+        "5. 如果当前晶体为'无'且问题中没有明确 material_id，"
+        "根据化学式调用 mp_search_for_ask。\n\n"
+        f"{current_section}\n\n"
+        f"## 参考资料\n{skill_text}"
+    )
+
+    # 4. 构造 message, 含历史
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # 注入本群历史（最多 10 轮）
+    for turn in get_history(group_id):
+        messages.append({"role": "user", "content": turn.user})
+        messages.append({"role": "assistant", "content": turn.assistant})
+
+    messages.append({"role": "user", "content": question})
+
+    # 5. 多轮工具循环调用
+
+    client = _get_client()
+    if client is None:
+        await bot.send(event, "AI 服务未配置，请检查 DEEPSEEK_API_KEY。")
+        return
+
+    for _ in range(5):
+        try:
+            response = await client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            logger.opt(exception=e).error("DeepSeek 调用失败")
+            await bot.send(event, "AI 分析失败，请稍后再试。")
+            return
+
+        msg = response.choices[0].message
+        messages.append(msg)
+
+        if not msg.tool_calls:
+            if msg.content:
+                await bot.send(event, msg.content)
+                add_turn(group_id, question, msg.content)
+            return
+
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": "参数解析失败",
+                })
+                continue
+
+            if name == "mp_prev_for_ask":
+                try:
+                    await _send_vesta_image(
+                        bot, event, args["material_id"], args["view"]
+                    )
+                    tool_result = f"已发送 {args['material_id']} 沿 {args['view']} 的投影图。"
+                except Exception as e:
+                    logger.opt(exception=e).error("mp_prev_for_ask 失败")
+                    tool_result = f"投影渲染失败: {type(e).__name__}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result,
+                })
+
+            elif name == "mp_search_for_ask":
+                formula = args.get("formula", "").strip()
+                if not formula:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "化学式为空",
+                    })
+                    continue
+                clear_cache(group_id)
+                results = await search_materials(formula, num_results=50)
+                if not results:
+                    await bot.send(event, f"未找到化学式 {formula} 的晶体。")
+                    return
+                cache = set_cache(group_id, results, formula)
+                await bot.send(event, "你要查以下哪个晶体？")
+                await bot.send(event, cache.format_page())
+                return
+
+            elif name == "mp_get_structure_info":
+                mid = args.get("material_id", "").strip()
+                data = await get_structure_info(mid) if mid else None
+                if data:
+                    tool_result = _format_structure_for_prompt(data)
+                else:
+                    tool_result = f"无法获取 {mid} 的结构数据。"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result,
+                })
+
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": f"未知工具: {name}",
+                })
+
+    await bot.send(event, "暂时无法确定答案呢, 请尝试更具体地描述问题喵")
+
+def _load_skill_text() -> str:
+    skill_path = os.path.join(os.path.dirname(__file__), "crystallography_skill.md")
+    if os.path.exists(skill_path):
+        with open(skill_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "（晶体学参考资料未找到，请根据通用知识回答。）"
+
+def _format_structure_for_prompt(data: dict) -> str:
+    """
+    把 get_structure_info() 返回的结构信息 dict 格式化为可读文本，
+    用于拼入 system prompt 或作为 tool 调用结果回传给 AI。
+    """
+    lines: list[str] = []
+
+    # 1. 基本信息
+    lines.append(f"### 结构数据: {data.get('material_id', '?')}")
+    formula = data.get("full_formula") or data.get("formula") or ""
+    if formula:
+        lines.append(f"- 化学式: {formula}")
+    if "nsites" in data:
+        lines.append(f"- 晶胞内原子数: {data['nsites']}")
+
+    # 2. 晶胞参数
+    lat = data.get("lattice")
+    if lat:
+        lines.append(
+            f"- 晶胞参数: a={lat.get('a')} Å, b={lat.get('b')} Å, c={lat.get('c')} Å, "
+            f"α={lat.get('alpha')}°, β={lat.get('beta')}°, γ={lat.get('gamma')}°, "
+            f"V={lat.get('volume')} Å³"
+        )
+
+    # 3. 对称性
+    if data.get("spacegroup_symbol"):
+        sg_num = data.get("spacegroup_number", "?")
+        lines.append(f"- 空间群: {data['spacegroup_symbol']} (No. {sg_num})")
+    if data.get("point_group"):
+        lines.append(f"- 点群: {data['point_group']}")
+    if data.get("crystal_system"):
+        lines.append(f"- 晶系: {data['crystal_system']}")
+
+    # 4. 物性
+    for key, label in (
+        ("density", "密度 (g/cm³)"),
+        ("band_gap", "带隙 (eV)"),
+        ("is_stable", "热力学稳定"),
+    ):
+        if key in data and data[key] is not None:
+            lines.append(f"- {label}: {data[key]}")
+
+    # 5. 原子位点表
+    sites = data.get("sites") or []
+    if sites:
+        lines.append("")
+        lines.append("原子位点（分数坐标）:")
+        lines.append("| 元素/占位 | x | y | z |")
+        lines.append("| --- | --- | --- | --- |")
+
+        for s in sites:
+            coords = s.get("fractional_coords") or [0.0, 0.0, 0.0]
+            x = coords[0] if len(coords) > 0 else 0.0
+            y = coords[1] if len(coords) > 1 else 0.0
+            z = coords[2] if len(coords) > 2 else 0.0
+
+            species = s.get("species")
+            if isinstance(species, dict) and species:
+                if len(species) == 1:
+                    # 有序位点：只显示元素名；若占位率 < 1，附带数值
+                    el, occ = next(iter(species.items()))
+                    if occ is None or float(occ) >= 0.999:
+                        species_text = str(el)
+                    else:
+                        species_text = f"{el}:{float(occ):.2f}"
+                else:
+                    # 无序位点：显示所有元素及占位率
+                    species_text = " / ".join(
+                        f"{el}:{float(occ):.2f}"
+                        for el, occ in species.items()
+                        if occ is None or float(occ) > 1e-6
+                    )
+            else:
+                # 旧格式 fallback
+                el = s.get("element", "?")
+                occ = s.get("occupancy", 1.0)
+                if occ is None or float(occ) >= 0.999:
+                    species_text = str(el)
+                else:
+                    species_text = f"{el}:{float(occ):.2f}"
+
+            lines.append(f"| {species_text} | {x} | {y} | {z} |")
+
+    return "\n".join(lines)
