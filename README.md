@@ -2,7 +2,7 @@
 
 # Materials Project Bot
 
-A QQ bot plugin based on [NoneBot2](https://github.com/nonebot/nonebot2) that integrates with the [Materials Project](https://materialsproject.org/) API to query crystal structures, search materials, obtain CIF files, and render crystal structure images via [VESTA](https://jp-minerals.org/vesta/) in group chats. It also integrates with DeepSeek to automatically recognize natural-language crystal queries in group chats and execute them on the user's behalf.
+A QQ chatbot plugin based on [NoneBot2](https://github.com/nonebot/nonebot2) that integrates with the [Materials Project](https://materialsproject.org/) API to query crystal structures, search materials, obtain CIF files, and render crystal structure images via [VESTA](https://jp-minerals.org/vesta/) in group chats. It also integrates with DeepSeek to automatically recognize natural-language crystal queries in group chats and execute them on the user's behalf.
 
 ---
 
