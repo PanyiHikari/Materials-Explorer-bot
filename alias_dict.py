@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import threading
@@ -5,66 +6,114 @@ from typing import Dict, List, Optional
 
 from nonebot.log import logger
 
-_DICT_PATH = os.path.join(os.path.dirname(__file__), "alias_dict.json")
+_PLUGIN_DIR = os.path.dirname(__file__)
+_PRIMARY_FILENAME = "alias_dict.json"
+_GLOB_PATTERN = "alias_dict*.json"
+
 _LOCK = threading.RLock()
 _cache: Optional[Dict[str, List[str]]] = None
-_cache_mtime: float = 0.0
+_cache_fingerprint: Optional[tuple] = None
 
 
-def _normalize(data) -> Dict[str, List[str]]:
+# ---------------- 文件发现与加载 ----------------
+
+def _dict_files() -> List[str]:
+    """返回所有别名 JSON 文件的绝对路径，按文件名排序"""
+    pattern = os.path.join(_PLUGIN_DIR, _GLOB_PATTERN)
+    return sorted(glob.glob(pattern))
+
+
+def _primary_path() -> str:
+    """主字典路径（/mp.dict 写入目标）"""
+    return os.path.join(_PLUGIN_DIR, _PRIMARY_FILENAME)
+
+
+def _load_one(path: str) -> Dict[str, List[str]]:
+    """读取单个字典文件，格式非法时返回空字典"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.opt(exception=e).warning("读取别名字典失败: {}", path)
+        return {}
+
     if not isinstance(data, dict):
-        logger.warning("别名字典格式异常，期望 dict")
+        logger.warning("别名字典格式异常（顶层应为对象）: {}", path)
         return {}
-    out: Dict[str, List[str]] = {}
+
+    result: Dict[str, List[str]] = {}
     for k, v in data.items():
+        if not isinstance(k, str):
+            logger.warning("别名字典键非字符串，已跳过: {} -> {}", k, path)
+            continue
         if isinstance(v, str):
-            out[k] = [v]
+            ids = [v]
         elif isinstance(v, list):
-            out[k] = [str(x) for x in v]
+            ids = [str(x) for x in v]
         else:
-            logger.warning(f"别名字典项 {k!r} 值类型异常，已跳过")
-    return out
+            logger.warning("别名字典项 {} 值类型异常，已跳过: {}", k, path)
+            continue
+        result[k] = ids
+    return result
 
 
-def _load_from_disk() -> Dict[str, List[str]]:
-    if not os.path.exists(_DICT_PATH):
-        return {}
-    try:
-        with open(_DICT_PATH, "r", encoding="utf-8") as f:
-            return _normalize(json.load(f))
-    except Exception as e:
-        logger.opt(exception=e).error("读取别名字典失败")
-        return {}
+def _merge_all(files: List[str]) -> Dict[str, List[str]]:
+    """
+    合并所有文件。同名别名取 ID 的并集（去重，保留首次出现顺序）。
+    若想改为"后加载覆盖前加载"，把 union 逻辑改为 merged[alias] = list(ids) 即可。
+    """
+    merged: Dict[str, List[str]] = {}
+    for path in files:
+        data = _load_one(path)
+        for alias, ids in data.items():
+            if alias in merged:
+                existing = merged[alias]
+                for mid in ids:
+                    if mid not in existing:
+                        existing.append(mid)
+            else:
+                merged[alias] = list(ids)
+    return merged
 
 
-def _save_to_disk(data: Dict[str, List[str]]) -> bool:
-    try:
-        tmp_path = _DICT_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp_path, _DICT_PATH)
-        return True
-    except Exception as e:
-        logger.opt(exception=e).error("写入别名字典失败")
-        return False
+def _fingerprint(files: List[str]) -> tuple:
+    """生成文件集合 + mtime 的指纹，用于检测变更"""
+    items = []
+    for p in files:
+        try:
+            items.append((p, os.path.getmtime(p)))
+        except OSError:
+            items.append((p, 0.0))
+    return tuple(items)
 
 
 def _get_cache() -> Dict[str, List[str]]:
-    """获取缓存；若磁盘 mtime 变化则重新加载（兼容后端手动编辑）"""
-    global _cache, _cache_mtime
+    """获取合并后的缓存；文件集合或任一文件 mtime 变化时重新加载"""
+    global _cache, _cache_fingerprint
     with _LOCK:
-        try:
-            mtime = os.path.getmtime(_DICT_PATH) if os.path.exists(_DICT_PATH) else 0.0
-        except OSError:
-            mtime = 0.0
-        if _cache is None or mtime != _cache_mtime:
-            _cache = _load_from_disk()
-            _cache_mtime = mtime
+        files = _dict_files()
+        fp = _fingerprint(files)
+        if _cache is None or fp != _cache_fingerprint:
+            _cache = _merge_all(files)
+            _cache_fingerprint = fp
+            logger.info(
+                "别名字典已加载：{} 个文件，{} 个别名",
+                len(files), len(_cache),
+            )
         return _cache
 
 
+def _force_reload():
+    global _cache, _cache_fingerprint
+    with _LOCK:
+        _cache = None
+        _cache_fingerprint = None
+
+
+# ---------------- 对外接口 ----------------
+
 def lookup(alias: str) -> List[str]:
-    """查询别名对应的所有 mp ID。大小写不敏感。"""
+    """查询别名对应的所有 mp ID（大小写不敏感）"""
     if not alias:
         return []
     with _LOCK:
@@ -79,41 +128,78 @@ def lookup(alias: str) -> List[str]:
 
 
 def add(alias: str, material_id: str) -> bool:
-    """添加别名 -> mp ID。重复添加不产生副本。"""
-    global _cache_mtime
+    """添加别名 -> mp ID，写入主文件 alias_dict.json（不存在时创建）"""
     alias = alias.strip()
     material_id = material_id.strip()
     if not alias or not material_id:
         return False
+
     with _LOCK:
-        data = _get_cache()
-        mids = data.setdefault(alias, [])
-        if material_id not in mids:
-            mids.append(material_id)
-        if not _save_to_disk(data):
-            return False
+        path = _primary_path()
+
+        # 读取主文件现有内容
+        current: Dict[str, List[str]] = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        if isinstance(v, str):
+                            current[k] = [v]
+                        elif isinstance(v, list):
+                            current[k] = [str(x) for x in v]
+            except Exception as e:
+                logger.opt(exception=e).warning("读取主别名字典失败: {}", path)
+
+        # 追加
+        ids = current.setdefault(alias, [])
+        if material_id in ids:
+            # 已存在，无需写盘，但视为成功
+            _force_reload()
+            return True
+
+        ids.append(material_id)
+
         try:
-            _cache_mtime = os.path.getmtime(_DICT_PATH)
-        except OSError:
-            _cache_mtime = 0.0
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(current, f, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.opt(exception=e).error("写入主别名字典失败: {}", path)
+            return False
+
+        _force_reload()
         return True
 
 
 def get_aliases_for_id(material_id: str) -> List[str]:
-    """反向查询：给定 mp ID 返回所有别名"""
+    """反向查询：返回所有映射到该 mp ID 的别名"""
     with _LOCK:
         data = _get_cache()
         return [alias for alias, mids in data.items() if material_id in mids]
 
 
-def reload():
-    """强制重新加载（一般无需手动调用）"""
-    global _cache, _cache_mtime
-    with _LOCK:
-        _cache = None
-        _cache_mtime = 0.0
-
 def all_aliases() -> List[str]:
-    """返回当前字典中所有别名（用于 AI 提示注入）"""
+    """返回合并后的所有别名（供 AI 提示注入使用）"""
     with _LOCK:
         return list(_get_cache().keys())
+
+
+def stats() -> dict:
+    """返回字典的加载统计信息（用于 /mp.dict.stats）"""
+    with _LOCK:
+        files = _dict_files()
+        data = _get_cache()
+        return {
+            "files": files,
+            "primary": _primary_path(),
+            "alias_count": len(data),
+            "id_count": len({mid for ids in data.values() for mid in ids}),
+        }
+
+
+def reload():
+    """强制重新加载（通常无需手动调用）"""
+    _force_reload()

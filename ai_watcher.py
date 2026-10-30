@@ -5,13 +5,13 @@ import re
 from nonebot.log import logger
 from openai import AsyncOpenAI
 
-from .config import config
-
 import os
 from .ask_context import get_context, set_context
 from .ask_swt import is_ask_enabled
 
 from .ai_memory import add_turn, get_history
+
+from .min_conf import get_min_confidence
 
 # DeepSeek 客户端(延迟初始化)
 
@@ -216,6 +216,28 @@ TOOLS = [
     },
 ]
 
+def _inject_confidence(tool: dict) -> dict:
+    """为每个工具自动添加 confidence 参数，要求 AI 返回置信度"""
+    params = tool["function"]["parameters"]
+    params.setdefault("properties", {})["confidence"] = {
+        "type": "number",
+        "description": (
+            "你对该次工具调用的信心，范围 0-1。"
+            "0.9 及以上: 用户意图明确，几乎确定；"
+            "0.7-0.9: 很可能正确；"
+            "0.5-0.7: 只是猜测；"
+            "低于 0.5: 不确定，最好不调用。"
+        ),
+    }
+    if "required" not in params:
+        params["required"] = []
+    if "confidence" not in params["required"]:
+        params["required"].append("confidence")
+    return tool
+
+
+TOOLS = [_inject_confidence(t) for t in TOOLS]
+
 
 # 消息过滤
 
@@ -228,7 +250,6 @@ def _looks_like_mp_command(text: str) -> bool:
     t = text.strip()
     for p in _MP_COMMAND_PREFIXES:
         if t.startswith(p):
-            # 排除 /mpxxx（不是 MP 指令）
             rest = t[len(p):]
             if not rest or rest[0] in (".", " ", "\t", "/", "／"):
                 return True
@@ -259,13 +280,64 @@ def _get_alias_hint(text: str) -> str:
         "插件会自动查别名字典并返回对应的晶体列表。"
     )
 
-_ASK_KEYWORDS = (
-    "对称", "旋转", "反轴", "映轴", "螺旋轴", "镜面", "反映", "反演", "滑移", "次轴", "晶系", "晶族", "空间群", "为什么", "在哪", "投影", "配位", "多面体", "晶胞", "点群", "键长", "占位率", "记住", "别名", "俗称", "关联", "就是",
+# 内置关键词：覆盖常见查询/问答表达
+_DEFAULT_KEYWORDS = (
+    # 动作
+    "查", "找", "搜", "看", "问", "告诉", "给", "发", "要", "为什么", "在哪",
+    # 对象
+    "晶体", "结构", "cif", "CIF", "mp-", "材料",
+    # 参数与属性
+    "晶胞", "参数", "晶格", "坐标", "原子", "空间群", "点群",
+    "晶系", "对称", "投影", "晶面", "配位", "多面体",
+    "带隙", "能带", "态密度", "衍射", "xrd", "XRD",
+    "晶族", "旋转", "反轴", "映轴", "螺旋轴", "镜面", 
+    "反映", "反演", "滑移", "次轴", "键长", "原子", "间距",
+    # 指代
+    "这个", "那个", "它", "第", "号",
+    # 字典
+    "别名", "记住", "关联", "俗称",
 )
 
-def should_analyze(text: str, is_at_bot: bool) -> bool:
+
+def _get_all_keywords() -> tuple:
+    from .config import config
+    custom = [
+        k.strip()
+        for k in config.ai_watch_keywords.split(",")
+        if k.strip()
+    ]
+    return _DEFAULT_KEYWORDS + tuple(custom)
+
+
+def _has_keyword(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw.lower() in text_lower for kw in _get_all_keywords())
+
+
+def should_analyze(
+    text: str,
+    is_at_bot: bool,
+    has_context: bool = False,
+) -> bool:
     """
     判断消息是否应该送给 AI 分析。
+
+    规则按 ai_watch_sensitivity 分三档：
+
+    strict:
+      - 必须 @bot
+      - 必须命中关键词
+      - 长度 ≤ 200
+
+    normal (默认):
+      - @bot 的消息直接送(长度 ≤ 200)
+      - 非 @bot 的消息须命中关键词且 ≤ 100 字符
+      - 若本群无查询上下文(has_context=False), 非 @bot 消息须同时命中
+        mp-\\d+ 或关键词，以过滤纯闲聊
+
+    loose:
+      - @bot 全送
+      - 非 @bot 且 ≤ 100 字符全送
     """
     text = text.strip()
     if not text:
@@ -275,18 +347,33 @@ def should_analyze(text: str, is_at_bot: bool) -> bool:
     if _looks_like_mp_command(text):
         return False
 
-    # @bot 的消息不受长度限制
-    if is_at_bot:
-        return True
+    from .config import config
+    mode = config.ai_watch_sensitivity.lower()
 
-    # 非 @bot 且过长 -> 跳过
+    if mode == "loose":
+        if is_at_bot:
+            return True
+        return len(text) <= 100
+
+    if mode == "strict":
+        if not is_at_bot:
+            return False
+        if len(text) > 200:
+            return False
+        return _has_keyword(text)
+
+    # normal（默认）
+    if is_at_bot:
+        return len(text) <= 200
     if len(text) > 100:
         return False
-
-    # 如果消息包含提问关键词，且 WATCH 已开启，允许送 AI
-    if not is_at_bot and any(k in text for k in _ASK_KEYWORDS):
-        return True
-
+    if not _has_keyword(text):
+        return False
+    # 无上下文时，非 @bot 消息还须包含 mp-\d+ 才放行，避免"这个怎么样"类闲聊
+    if not has_context:
+        import re
+        if re.search(r"mp-\d+", text, re.IGNORECASE) is None:
+            return False
     return True
 
 
@@ -296,29 +383,44 @@ async def analyze_message(
     text: str,
     group_id: str = None,
 ) -> Optional[List[Dict[str, Any]]]:
+    """
+    把消息送给 DeepSeek 分析，返回工具调用列表。
+    每次调用都会读取当前群的有效置信度阈值并过滤低置信度的工具调用。
+    """
     client = _get_client()
     if client is None:
         return None
 
+    # 读取阈值
+    # 优先取群级配置（/mp.minconf 写入），否则用 config 里的全局默认值
+    from .config import config
+    threshold = get_min_confidence(group_id) if group_id else config.ai_watch_min_confidence
+
     try:
         system_content = (
-            "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。"
-            "如果用户表达了查询意图，调用相应的工具；否则不要调用任何工具。"
-            "注意：'第 N 号'、'N 号'中的 N 是搜索结果中的序号，"
-            "对应 mp_res_cif / mp_res_prev 的 index 参数。"
-            "如果用户同时想要 CIF 文件和结构图，可以同时调用 mp_res_cif 和 mp_res_prev。"
-            "如果消息是简短的追问（如'那它呢'、'第二个呢'、'为什么'），"
-            "请结合下文的历史对话理解其指代对象。"
-            "对于晶体学问答类问题（如'属于什么晶系'、'4 次轴在哪里'、"
-            "'为什么具有这个对称性'），调用 ask_question 工具。"
+            "你是一个晶体结构查询助手。分析群聊消息，判断用户是否想查询晶体结构。\n\n"
+            "**判断原则（重要）**：\n"
+            "1. 仅在用户消息**明确表达**晶体结构查询或晶体学问答意图时才调用工具。\n"
+            "2. 如果消息是闲聊、表情、对 bot 的赞美/吐槽、或其他 bot 的输出，"
+            "**不要调用任何工具**。\n"
+            "3. 如果消息需要大量推测才能理解为查询，**不要调用任何工具**。\n"
+            "4. 不确定时倾向于**不调用**——宁可漏一次，不要误触发。\n\n"
+            "**关于 confidence 参数**：\n"
+            "每个工具调用必须附带 confidence 参数（0-1），表示你对该调用的信心。"
+            "系统会根据当前群的阈值过滤低置信度的调用。\n\n"
+            "其余规则：\n"
+            "- '第 N 号'、'N 号' 中的 N 是搜索结果序号，对应 mp_res_cif / mp_res_prev 的 index。\n"
+            "- 简短追问（'那它呢''第二个呢'）可以结合历史理解，但若历史中无相关晶体，则不调用。\n"
+            "- 对于晶体学问答类问题（'属于什么晶系''4 次轴在哪里'），调用 ask_question。\n"
         )
-        # 别名提示：如果消息里出现字典中的别名，要求 AI 原样传递
+        # 别名提示（保留之前的逻辑）
         system_content += _get_alias_hint(text)
 
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
 
+        # 注入最近 3 轮历史
         if group_id:
             for turn in get_history(group_id, max_turns=3):
                 messages.append({"role": "user", "content": turn.user})
@@ -331,12 +433,14 @@ async def analyze_message(
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
+            reasoning_effort="none",
         )
 
         message = response.choices[0].message
         if not message.tool_calls:
             return None
 
+        # 过滤低置信度调用
         calls: List[Dict[str, Any]] = []
         for tc in message.tool_calls:
             try:
@@ -344,6 +448,23 @@ async def analyze_message(
             except json.JSONDecodeError:
                 logger.warning(f"AI 返回的 arguments 无法解析: {tc.function.arguments}")
                 continue
+
+            # 取出 confidence 并从 args 中删除，避免传给业务函数
+            # 默认 1.0: AI 既然调用了工具，视为较高信心
+            conf_raw = args.pop("confidence", 1.0)
+            try:
+                conf = float(conf_raw)
+            except (TypeError, ValueError):
+                conf = 1.0
+
+            if conf < threshold:
+                logger.info(
+                    f"[AI-WATCH] 丢弃低置信度调用: {tc.function.name} "
+                    f"conf={conf:.2f} < threshold={threshold:.2f} "
+                    f"args={args}"
+                )
+                continue
+
             calls.append({"name": tc.function.name, "arguments": args})
 
         return calls if calls else None
@@ -353,6 +474,27 @@ async def analyze_message(
         return None
 
 _VERBOSE_KEYWORDS = ("详细", "展开", "详述", "深入", "推理过程", "逐步", "理由", "原因")
+
+def _build_ask_kwargs() -> dict:
+    """
+    根据配置构造 ask_question 的 DeepSeek 调用参数。
+    """
+    from .config import config
+
+    kwargs = {
+        "model": "deepseek-flash",   
+        "tools": TOOLS,
+        "tool_choice": "auto",
+    }
+
+    if config.ai_ask_thinking:
+        kwargs["reasoning_effort"] = config.ai_ask_reasoning_effort
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        # 显式关闭，避免继承服务端默认的“思考开启”
+        kwargs["reasoning_effort"] = "none"
+
+    return kwargs
 
 async def ask_question(bot, event, question: str):
     """回答晶体学/材料学问题。安全处理 ctx 为空的情况。"""
@@ -486,10 +628,8 @@ async def ask_question(bot, event, question: str):
     for _ in range(5):
         try:
             response = await client.chat.completions.create(
-                model="deepseek-chat",
                 messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
+                **_build_ask_kwargs(),
             )
         except Exception as e:
             logger.opt(exception=e).error("DeepSeek 调用失败")
@@ -497,7 +637,7 @@ async def ask_question(bot, event, question: str):
             return
 
         msg = response.choices[0].message
-        messages.append(msg)
+        messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
             if msg.content:

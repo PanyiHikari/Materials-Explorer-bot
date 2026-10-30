@@ -60,7 +60,7 @@ def _sync_render_vesta(
             if abs(rz) > 1e-3:
                 args += ["-rotate_z", f"{rz:.3f}"]
         except Exception as e:
-            logger.error(f"计算投影角度失败: {e}", exc_info=True)
+            logger.opt(exception=e).error("计算投影角度失败")
             return False
 
     args += ["-export_img", output_png, "-close"]
@@ -98,7 +98,7 @@ def _sync_render_vesta(
         logger.error(f"VESTA 可执行文件未找到: {vesta_exec}")
         return False
     except Exception as e:
-        logger.error(f"VESTA 渲染失败: {e}", exc_info=True)
+        logger.opt(exception=e).error("VESTA 渲染失败")
         if proc:
             try:
                 proc.kill()

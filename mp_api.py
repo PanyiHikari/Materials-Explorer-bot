@@ -82,7 +82,7 @@ def _sync_search(query: str, num_results: int = 50) -> List[Dict[str, Any]]:
                 })
 
     except Exception as e:
-        logger.error(f"搜索失败: {e}", exc_info=True)
+        logger.opt(exception=e).error("搜索失败")
     return results
 
 
@@ -174,7 +174,7 @@ def _sync_get_structure_info(material_id: str) -> Optional[Dict[str, Any]]:
             return result
 
     except Exception as e:
-        logger.error(f"获取结构信息失败 {material_id}: {e}", exc_info=True)
+        logger.opt(exception=e).error("获取结构信息失败 {}", material_id)
         return None
 
 

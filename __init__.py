@@ -29,15 +29,22 @@ from .ai_watcher import (
     ask_question,
 )
 
-from .ask_context import set_context
 from .ask_context import get_context, set_context
 from .ask_swt import is_ask_enabled, toggle_ask
-from .ai_watcher import ask_question
 from .ai_memory import clear_group as clear_ai_group, clear_all as clear_ai_all, stats as ai_stats
 
 from .alias_dict import add as add_alias, lookup as lookup_alias
 from .mp_api import resolve_search
-from .ask_context import get_context
+
+from .min_conf import (
+    get_min_confidence,
+    set_min_confidence,
+    clear_min_confidence,
+    is_group_configured,
+    get_default_confidence,
+)
+
+import asyncio
 
 # 帮助信息
 
@@ -82,6 +89,8 @@ async def _send_cif(bot: Bot, event: GroupMessageEvent, material_id: str):
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+from nonebot.adapters.onebot.v11.exception import ActionFailed
+
 async def _send_vesta_image(
     bot: Bot,
     event: GroupMessageEvent,
@@ -90,6 +99,8 @@ async def _send_vesta_image(
 ):
     """
     渲染并发送晶体结构图片。
+    view: None -> (113)；"tri" -> 三视图；其他 -> (hkl)。
+    返回是否至少成功发送了一张图片。
     """
     if view is None:
         views = ["113"]
@@ -105,12 +116,34 @@ async def _send_vesta_image(
             logger.warning(f"渲染 {material_id} ({v}) 失败")
             continue
 
-        any_success = True
         try:
             with open(png_path, "rb") as f:
                 image_data = f.read()
-            set_context(_get_group_id(event), material_id)
-            await bot.send(event, MessageSegment.image(image_data))
+
+            # 发送，最多重试 1 次
+            sent = False
+            for attempt in (1, 2):
+                try:
+                    await bot.send(event, MessageSegment.image(image_data))
+                    sent = True
+                    break
+                except ActionFailed as e:
+                    logger.warning(
+                        "发送图片失败（第 {} 次）: material={} view={} retcode={}",
+                        attempt, material_id, v,
+                        getattr(e, "info", {}).get("retcode") if hasattr(e, "info") else "?",
+                    )
+                    if attempt == 1:
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    logger.opt(exception=e).error(
+                        "发送图片时发生未预期错误: material={} view={}", material_id, v
+                    )
+                    break
+
+            if sent:
+                any_success = True
+
         finally:
             try:
                 os.remove(png_path)
@@ -121,8 +154,7 @@ async def _send_vesta_image(
             except Exception:
                 pass
 
-    if not any_success:
-        await bot.send(event, f"晶体结构渲染 {material_id} 失败，请查看后台日志。")
+    return any_success
 
 async def _check_enabled_and_cooldown(
     bot: Bot,
@@ -204,8 +236,11 @@ async def handle_help(bot: Bot, event: GroupMessageEvent):
         "/mp.dict <别名> [mp ID]            关联别名与晶体\n"
         "  不填 mp ID 时使用本群最近查询的晶体\n"
         "\n"
-        "【对话记忆】\n"
+        "【AI 功能】\n"
         "/mp.ai.CLR                         清除本群 AI 对话记忆\n"
+        "  AI 胡言乱语时建议使用\n"
+        "/mp.minconf <minconf>              设置 AI 监听最小置信度\n"
+        "  经常误触时建议调高, 对 AI 说话没反应时建议调低"
     )
     await bot.send(event, help_text)
 
@@ -393,6 +428,29 @@ async def handle_mp_dict(bot: Bot, event: GroupMessageEvent, args: Message = Com
     else:
         await bot.send(event, "写入别名字典失败，请查看后台日志。")
 
+# /mp.dict.stats
+
+from .alias_dict import stats as alias_stats
+
+mp_dict_stats_cmd = on_command("mp.dict.stats", rule=to_me(), priority=10, block=True)
+
+@mp_dict_stats_cmd.handle()
+async def handle_mp_dict_stats(bot: Bot, event: GroupMessageEvent):
+    info = alias_stats()
+    files_text = "\n".join(
+        f"  - {os.path.basename(p)}"
+        for p in info["files"]
+    ) or "  （无）"
+    await bot.send(
+        event,
+        "别名字典加载状态\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"加载文件（{len(info['files'])} 个）：\n{files_text}\n"
+        f"主字典：{os.path.basename(info['primary'])}\n"
+        f"别名总数：{info['alias_count']}\n"
+        f"涉及 mp ID 数：{info['id_count']}"
+    )
+
 # 管理指令
 
 # /mp.SWT
@@ -443,6 +501,56 @@ async def handle_mp_ai_clrall(bot: Bot, event: GroupMessageEvent):
     n = clear_ai_all()
     await bot.send(event, f"已清除全部 AI 记忆（共 {n} 个群）")
 
+mp_minconf_cmd = on_command("mp.minconf", rule=to_me(), priority=5, block=True)
+
+# /mp.minconf
+
+@mp_minconf_cmd.handle()
+async def handle_mp_minconf(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
+    group_id = _get_group_id(event)
+    text = args.extract_plain_text().strip()
+
+    # 无参数：查看当前值
+    if not text:
+        current = get_min_confidence(group_id)
+        source = "本群设置" if is_group_configured(group_id) else "全局默认值"
+        await bot.send(
+            event,
+            f"当前 AI 监听置信度阈值：{current:.2f}（{source}）\n"
+            f"全局默认值：{get_default_confidence():.2f}\n"
+            f"用法：/mp.minconf <0-1> 设置；/mp.minconf reset 恢复默认"
+        )
+        return
+
+    # reset：恢复默认
+    if text.lower() in ("reset", "clear", "default"):
+        removed = clear_min_confidence(group_id)
+        if removed:
+            await bot.send(
+                event,
+                f"已恢复本群阈值到全局默认值 {get_default_confidence():.2f}。"
+            )
+        else:
+            await bot.send(
+                event,
+                f"本群此前未设置阈值，当前使用全局默认值 {get_default_confidence():.2f}。"
+            )
+        return
+
+    # 数值：设置阈值
+    try:
+        value = float(text)
+    except ValueError:
+        await bot.send(event, "请输入 0 到 1 之间的数字，例如：/mp.minconf 0.7")
+        return
+
+    if not (0.0 <= value <= 1.0):
+        await bot.send(event, "阈值必须在 0 到 1 之间。")
+        return
+
+    set_min_confidence(group_id, value)
+    await bot.send(event, f"已将本群 AI 监听置信度阈值设为 {value:.2f}。")
+
 # AI 消息监听
 
 ai_watch_msg = on_message(priority=20, block=False)
@@ -451,26 +559,25 @@ ai_watch_msg = on_message(priority=20, block=False)
 async def handle_ai_watch(bot: Bot, event: GroupMessageEvent):
     group_id = _get_group_id(event)
 
-    # 未开启 WATCH 则忽略
     if not is_watch_enabled(group_id):
         return
-
-    # 插件被禁用则忽略
     if not is_enabled(group_id):
         return
 
-    # 判断消息是否应该送给 AI
     plain = event.get_plaintext()
     is_at_bot = event.is_tome()
-    if not should_analyze(plain, is_at_bot):
+
+    # 判断本群是否已有查询上下文
+    from .ask_context import get_context
+    has_context = get_context(group_id) is not None
+
+    if not should_analyze(plain, is_at_bot, has_context=has_context):
         return
 
-    # 调用 AI 分析
     calls = await analyze_message(plain, group_id=group_id)
     if not calls:
         return
 
-    # 逐条执行 AI 返回的指令
     for call in calls:
         await _dispatch_ai_call(bot, event, call)
 
@@ -520,7 +627,7 @@ async def _dispatch_ai_call(
     try:
         await bot.send(event, f"正在调用 {cmd_text}")
     except Exception as e:
-        logger.warning(f"发送调用通知失败: {e}")
+        logger.opt(exception=e).warning("发送调用通知失败: {}", name)
 
     try:
         if name == "mp_search":
@@ -570,12 +677,6 @@ async def _dispatch_ai_call(
             view = args.get("view")
             await _send_vesta_image(bot, event, result["material_id"], view)
 
-        elif name == "ask_question":
-            if not is_ask_enabled(group_id):
-                await bot.send(event, "/mp.ask 指令已禁用")
-                return
-            await ask_question(bot, event, args["question"])
-
         elif name == "mp_get_structure_info":
             material_id = args.get("material_id", "").strip()
             if not material_id:
@@ -622,7 +723,7 @@ async def _dispatch_ai_call(
             logger.warning(f"AI 返回了未知工具: {name}")
 
     except Exception as e:
-        logger.error(f"执行 AI 指令 {name} 失败: {e}", exc_info=True)
+        logger.opt(exception=e).error("执行 AI 指令 {} 失败", name)
 
 mp_ask_cmd = on_command("mp.ask", rule=to_me(), priority=10, block=True)
 
