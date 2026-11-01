@@ -5,6 +5,8 @@ import re
 from nonebot.log import logger
 from openai import AsyncOpenAI
 
+from .config import config
+
 import os
 from .ask_context import get_context, set_context
 from .ask_swt import is_ask_enabled
